@@ -46,6 +46,8 @@ export interface ProxySummary {
    * configured endpoint. Missing from older team servers and callers without
    * permission to reveal proxy details. */
   last_ip?: string | null;
+  /** Whether a private provider rotation link is saved for this proxy. */
+  has_rotation?: boolean;
   /** The exit's zone from the last check, if any — what "follow the exit" resolves to. */
   last_timezone?: string | null;
 }
@@ -531,6 +533,10 @@ export interface LocalProxy {
   last_timezone?: string | null;
   /** Provider link that hands out a new exit IP. */
   rotate_url: string | null;
+  /** A private provider rotation link is saved, without returning that link. */
+  has_rotation?: boolean;
+  /** Remove the saved rotation link. A blank `rotate_url` otherwise preserves it. */
+  clear_rotation?: boolean;
   /** Where to ask what the exit looks like; null uses the default. */
   checker_url: string | null;
 }
@@ -1139,8 +1145,8 @@ export const api = {
    *  interface translates. See agent/src/diagnose.rs. */
   diagnoseProxy: (url: string, checkerUrl?: string | null, proxyId?: string | null): Promise<Diagnosis> =>
     cmd<Diagnosis>("diagnose_proxy", { url, checkerUrl: checkerUrl || null, proxyId: proxyId || null }),
-  rotateProxy: (id: string): Promise<{ ok: boolean; error?: string }> =>
-    cmd("rotate_proxy", { id }),
+  rotateProxy: (id: string, origin?: Origin): Promise<{ ok: boolean; error?: string }> =>
+    cmd("rotate_proxy", { id, origin: origin ?? null }),
   // ---- giving one profile to one person --------------------------------
 
   /** Seals the profile key to the recipient and posts it. All of that happens

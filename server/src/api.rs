@@ -59,6 +59,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/auth/enroll/{code}/email/verify", post(enroll_email_verify))
         .route("/v1/auth/signup", post(signup))
         .route("/v1/server", get(server_info))
+        .route("/v1/capabilities", get(capabilities))
         .route("/v1/me", get(whoami))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -103,6 +104,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/v1/proxies/{proxy_id}/credentials", get(reveal_proxy))
         .route("/v1/proxies/{proxy_id}/check", post(record_proxy_check))
+        .route("/v1/proxies/{proxy_id}/rotate", post(record_proxy_rotation))
         .route(
             "/v1/profiles/{profile_id}",
             axum::routing::patch(edit_profile).delete(delete_profile),
@@ -365,6 +367,12 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     // And whether an invited address is confirmed by email: the person
     // sending a code is told whether the code alone is enough (mail.rs).
     Json(json!({ "open_signup": state.open_signup, "email_check": state.mailer.is_some() }))
+}
+
+/// Features whose absence would otherwise make a new desktop client silently
+/// downgrade a write against an older server that ignores unknown JSON keys.
+async fn capabilities() -> Json<serde_json::Value> {
+    Json(json!({ "proxy_rotation": true }))
 }
 
 /// Whether redeeming this invitation takes the six digits from the letter.
@@ -1223,6 +1231,7 @@ pub(crate) async fn profiles_in(
         proxy_host: Option<String>,
         proxy_country: Option<String>,
         proxy_last_ip: Option<String>,
+        proxy_has_rotation: Option<bool>,
         lock_user: Option<Uuid>,
         lock_email: Option<String>,
         lock_machine: Option<String>,
@@ -1238,6 +1247,7 @@ pub(crate) async fn profiles_in(
                x.id AS proxy_id, x.name AS proxy_name, x.kind::text AS proxy_kind,
                x.host || ':' || x.port AS proxy_host, x.last_country AS proxy_country,
                host(x.last_ip) AS proxy_last_ip,
+               (x.rotate_url_enc IS NOT NULL) AS proxy_has_rotation,
                l.user_id AS lock_user, u.email AS lock_email, l.machine_name AS lock_machine,
                {acquired} AS lock_acquired, {expires} AS lock_expires, p.name AS project_name
         FROM profiles f
@@ -1261,7 +1271,7 @@ pub(crate) async fn profiles_in(
         .map(
             |ProfileListRow {
                 id, name, tags, persona_id, current_version,
-                proxy_id, proxy_name, proxy_kind, proxy_host, proxy_country, proxy_last_ip,
+                proxy_id, proxy_name, proxy_kind, proxy_host, proxy_country, proxy_last_ip, proxy_has_rotation,
                 lock_user, lock_email, lock_machine, lock_acquired, lock_expires,
                 project_name,
             }| {
@@ -1308,6 +1318,7 @@ pub(crate) async fn profiles_in(
                         // endpoint: do not hand it to a caller without the
                         // permission to reveal proxy details.
                         last_ip: reveal.then_some(proxy_last_ip).flatten(),
+                        has_rotation: proxy_has_rotation.unwrap_or(false),
                         detected_kind: None,
                         last_checked_at: None,
                         shared_with_profiles: 0,
@@ -2146,9 +2157,10 @@ async fn create_proxy(
     // 24-byte nonce plus a tag: anything shorter cannot be a sealed value, and
     // storing one would fail on an operator's machine at launch, with nothing
     // to point at.
-    if wrapped_dek.len() < 40 || credentials_enc.len() < 40 {
+    if wrapped_dek.len() < 40 || credentials_enc.len() < 40
+        || rotate_url_enc.as_ref().is_some_and(|v| v.len() < 40) {
         return Err(ApiError::BadRequest(
-            "credentials_enc and wrapped_dek must be sealed values".into(),
+            "proxy secrets must be sealed values".into(),
         ));
     }
 
@@ -2317,7 +2329,7 @@ struct AuditEntry {
 /// One row of `list_proxies_sql`.
 pub(crate) type ProxyRow = (
     Uuid, String, String, String, i32, Option<String>, Option<String>, Option<String>, i64,
-    Option<Uuid>, Option<String>, Option<String>,
+    Option<Uuid>, Option<String>, Option<String>, bool,
 );
 
 /// The organisation's proxies, with who added each, as SQL. A function so a
@@ -2327,7 +2339,7 @@ pub(crate) fn list_proxies_sql() -> String {
         "SELECT x.id, x.name, x.kind::text, x.host, x.port, x.last_country, \
                 x.last_kind_detected, {}, \
                 (SELECT count(*) FROM profiles f WHERE f.proxy_id = x.id AND f.deleted_at IS NULL), \
-                x.created_by, u.email, host(x.last_ip) \
+                x.created_by, u.email, host(x.last_ip), (x.rotate_url_enc IS NOT NULL) \
          FROM proxies x LEFT JOIN users u ON u.id = x.created_by \
          WHERE x.org_id = $1 AND x.deleted_at IS NULL \
          ORDER BY x.name",
@@ -2362,7 +2374,7 @@ async fn list_proxies(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, name, kind, host, port, country, detected, checked, used, author, author_email, last_ip)| ProxySummary {
+            .map(|(id, name, kind, host, port, country, detected, checked, used, author, author_email, last_ip, has_rotation)| ProxySummary {
                 id,
                 name,
                 kind,
@@ -2377,6 +2389,7 @@ async fn list_proxies(
                 },
                 country,
                 last_ip: reveal.then_some(last_ip).flatten(),
+                has_rotation,
                 detected_kind: detected,
                 last_checked_at: checked,
                 shared_with_profiles: used,
@@ -2714,6 +2727,13 @@ pub struct EditProxyRequest {
     credentials_enc: Option<String>,
     #[serde(default)]
     wrapped_dek: Option<String>,
+    /// Replacement provider rotation URL, sealed under this proxy's data key.
+    /// Absent deliberately preserves the existing link.
+    #[serde(default)]
+    rotate_url_enc: Option<String>,
+    /// Unlike an absent replacement, this explicitly removes the saved link.
+    #[serde(default)]
+    clear_rotation: bool,
 }
 
 /// Change a proxy.
@@ -2753,15 +2773,15 @@ async fn edit_proxy(
     // Otherwise an edit queued behind another configuration change could retain
     // that newer configuration's check while restoring the old endpoint.
     let mut tx = db.begin().await?;
-    let stored: Option<(String, String, i32)> = sqlx::query_as(
-        "SELECT kind::text, host, port FROM proxies \
+    let stored: Option<(String, String, i32, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT kind::text, host, port, rotate_url_enc FROM proxies \
          WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(proxy_id)
     .bind(caller.org_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((stored_kind, stored_host, stored_port)) = stored else {
+    let Some((stored_kind, stored_host, stored_port, stored_rotation)) = stored else {
         return Err(ApiError::NotFound);
     };
     let host = match &stored_host {
@@ -2787,6 +2807,27 @@ async fn edit_proxy(
             ))
         }
     };
+    let rotate_url_enc = req
+        .rotate_url_enc
+        .as_deref()
+        .map(|v| unhex("rotate_url_enc", v))
+        .transpose()?;
+    if rotate_url_enc.as_ref().is_some_and(|v| v.len() < 40) {
+        return Err(ApiError::BadRequest("rotate_url_enc must be a sealed value".into()));
+    }
+    if req.clear_rotation && rotate_url_enc.is_some() {
+        return Err(ApiError::BadRequest(
+            "replace or clear a rotation link, not both".into(),
+        ));
+    }
+    // Rotation ciphertext is sealed under the proxy data key. Replacing that
+    // key while retaining old ciphertext makes the saved link permanently
+    // unreadable, so require the native client to re-seal it or remove it.
+    if credentials.is_some() && stored_rotation.is_some() && rotate_url_enc.is_none() && !req.clear_rotation {
+        return Err(ApiError::BadRequest(
+            "a credential change must re-seal or explicitly clear the saved rotation link".into(),
+        ));
+    }
 
     // An exit describes one exact upstream. A label correction leaves the
     // observation useful; changing where or how it dials does not. Clear it in
@@ -2802,11 +2843,12 @@ async fn edit_proxy(
             sqlx::query(
                 "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4, \
                         credentials_enc = $5, wrapped_dek = $6, \
-                        last_ip = CASE WHEN $9 THEN NULL ELSE last_ip END, \
-                        last_country = CASE WHEN $9 THEN NULL ELSE last_country END, \
-                        last_timezone = CASE WHEN $9 THEN NULL ELSE last_timezone END, \
-                        last_checked_at = CASE WHEN $9 THEN NULL ELSE last_checked_at END, \
-                        last_error = CASE WHEN $9 THEN NULL ELSE last_error END \
+                        rotate_url_enc = CASE WHEN $9 THEN NULL WHEN $10::bytea IS NOT NULL THEN $10::bytea ELSE rotate_url_enc END, \
+                        last_ip = CASE WHEN $11 THEN NULL ELSE last_ip END, \
+                        last_country = CASE WHEN $11 THEN NULL ELSE last_country END, \
+                        last_timezone = CASE WHEN $11 THEN NULL ELSE last_timezone END, \
+                        last_checked_at = CASE WHEN $11 THEN NULL ELSE last_checked_at END, \
+                        last_error = CASE WHEN $11 THEN NULL ELSE last_error END \
                  WHERE id = $7 AND org_id = $8 AND deleted_at IS NULL",
             )
             .bind(req.name.trim())
@@ -2817,6 +2859,8 @@ async fn edit_proxy(
             .bind(&d)
             .bind(proxy_id)
             .bind(caller.org_id)
+            .bind(req.clear_rotation)
+            .bind(&rotate_url_enc)
             .bind(configuration_changed)
             .execute(&mut *tx)
             .await?
@@ -2824,11 +2868,12 @@ async fn edit_proxy(
         None => {
             sqlx::query(
                 "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4, \
-                        last_ip = CASE WHEN $7 THEN NULL ELSE last_ip END, \
-                        last_country = CASE WHEN $7 THEN NULL ELSE last_country END, \
-                        last_timezone = CASE WHEN $7 THEN NULL ELSE last_timezone END, \
-                        last_checked_at = CASE WHEN $7 THEN NULL ELSE last_checked_at END, \
-                        last_error = CASE WHEN $7 THEN NULL ELSE last_error END \
+                        rotate_url_enc = CASE WHEN $7 THEN NULL WHEN $8::bytea IS NOT NULL THEN $8::bytea ELSE rotate_url_enc END, \
+                        last_ip = CASE WHEN $9 THEN NULL ELSE last_ip END, \
+                        last_country = CASE WHEN $9 THEN NULL ELSE last_country END, \
+                        last_timezone = CASE WHEN $9 THEN NULL ELSE last_timezone END, \
+                        last_checked_at = CASE WHEN $9 THEN NULL ELSE last_checked_at END, \
+                        last_error = CASE WHEN $9 THEN NULL ELSE last_error END \
                  WHERE id = $5 AND org_id = $6 AND deleted_at IS NULL",
             )
             .bind(req.name.trim())
@@ -2837,6 +2882,8 @@ async fn edit_proxy(
             .bind(req.port)
             .bind(proxy_id)
             .bind(caller.org_id)
+            .bind(req.clear_rotation)
+            .bind(&rotate_url_enc)
             .bind(configuration_changed)
             .execute(&mut *tx)
             .await?
@@ -2847,7 +2894,8 @@ async fn edit_proxy(
     }
 
     audit(&mut *tx, &caller, "proxy.edit", Some(proxy_id),
-          json!({ "credentials_changed": req.credentials_enc.is_some(), "configuration_changed": configuration_changed })).await?;
+          json!({ "credentials_changed": req.credentials_enc.is_some(), "configuration_changed": configuration_changed,
+                  "rotation_changed": req.clear_rotation || req.rotate_url_enc.is_some() })).await?;
     tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -2873,8 +2921,8 @@ async fn reveal_proxy(
         return Err(ApiError::Denied(Perm::RevealSecrets));
     }
 
-    let row: Option<(String, String, i32, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT kind::text, host, port, credentials_enc, wrapped_dek \
+    let row: Option<(String, String, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT kind::text, host, port, credentials_enc, wrapped_dek, rotate_url_enc \
          FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
     )
     .bind(proxy_id)
@@ -2882,7 +2930,7 @@ async fn reveal_proxy(
     .fetch_optional(db.as_mut())
     .await?;
 
-    let (kind, host, port, credentials_enc, wrapped_dek) = row.ok_or(ApiError::NotFound)?;
+    let (kind, host, port, credentials_enc, wrapped_dek, rotate_url_enc) = row.ok_or(ApiError::NotFound)?;
     let (Some(credentials_enc), Some(wrapped_dek)) = (credentials_enc, wrapped_dek) else {
         return Err(ApiError::BadRequest(
             "this proxy has no stored credentials".into(),
@@ -2903,6 +2951,13 @@ async fn reveal_proxy(
         // webview, then compared while the result is stored. A late answer must
         // not describe a proxy somebody has since edited.
         "check_version": proxy_check_version(&kind, &host, port, &credentials_enc, &wrapped_dek),
+        // The URL is still sealed and only sent to a caller already allowed to
+        // receive proxy credentials. The native shell opens it only long
+        // enough to ask the provider to rotate.
+        "rotate_url_enc": rotate_url_enc.as_deref().map(hex),
+        "rotation_version": rotate_url_enc.as_deref().map(|rotation| {
+            proxy_rotation_version(&kind, &host, port, &credentials_enc, &wrapped_dek, rotation)
+        }),
     })))
 }
 
@@ -2916,6 +2971,29 @@ fn proxy_check_version(kind: &str, host: &str, port: i32, credentials: &[u8], de
     hasher.update(b"fury-proxy-check-v1");
     let port = port.to_be_bytes();
     for part in [kind.as_bytes(), host.as_bytes(), port.as_slice(), credentials, dek] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Version for the handoff that clears a checked exit after a successful
+/// provider rotation. It includes the private rotation ciphertext, so a link
+/// changed while the provider request was in flight cannot clear a newer row.
+fn proxy_rotation_version(
+    kind: &str,
+    host: &str,
+    port: i32,
+    credentials: &[u8],
+    dek: &[u8],
+    rotation: &[u8],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"fury-proxy-rotation-v1");
+    let port = port.to_be_bytes();
+    for part in [kind.as_bytes(), host.as_bytes(), port.as_slice(), credentials, dek, rotation] {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
@@ -3003,6 +3081,57 @@ async fn record_proxy_check(
     .execute(&mut *tx)
     .await?;
     audit(&mut *tx, &caller, "proxy.check", Some(proxy_id), json!({})).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ProxyRotationRequest {
+    rotation_version: String,
+}
+
+/// A native client has successfully called a saved provider rotation link.
+/// The provider request happens locally through that proxy; this endpoint only
+/// atomically clears the previous exit observation if the sealed configuration
+/// is still exactly the one used for that request.
+async fn record_proxy_rotation(
+    mut db: auth::Db,
+    Path(proxy_id): Path<Uuid>,
+    Json(req): Json<ProxyRotationRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !caller.implicit_permissions().has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+    if req.rotation_version.len() != 64 || !req.rotation_version.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("the proxy rotation is missing its configuration version".into()));
+    }
+
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT kind::text, host, port, credentials_enc, wrapped_dek, rotate_url_enc \
+         FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((kind, host, port, Some(credentials), Some(dek), Some(rotation))) = row else {
+        return Err(ApiError::NotFound);
+    };
+    if req.rotation_version != proxy_rotation_version(&kind, &host, port, &credentials, &dek, &rotation) {
+        return Err(ApiError::Conflict("the proxy changed while it was rotating; check it again".into()));
+    }
+    sqlx::query(
+        "UPDATE proxies SET last_ip = NULL, last_country = NULL, last_timezone = NULL, \
+                            last_checked_at = NULL, last_error = NULL \
+         WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .execute(&mut *tx)
+    .await?;
+    audit(&mut *tx, &caller, "proxy.rotate", Some(proxy_id), json!({})).await?;
     tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }

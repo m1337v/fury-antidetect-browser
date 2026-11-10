@@ -179,6 +179,25 @@ fn reqwest_failure(e: &reqwest::Error) -> (&'static str, String) {
     }
 }
 
+/// Ask a provider to rotate through the proxy whose session it may bind to.
+/// Keep the URL out of failures: rotation links commonly contain provider API
+/// tokens and an error message may be copied into a support ticket.
+async fn rotate_through_proxy(proxy_url: &str, rotation_url: &str) -> anyhow::Result<serde_json::Value> {
+    let upstream = crate::parse_upstream(proxy_url)
+        .map_err(|_| anyhow::anyhow!("Could not prepare the proxy route for rotation."))?;
+    let (route, _relay) = crate::relay::loopback(upstream)
+        .await
+        .map_err(|_| anyhow::anyhow!("Could not start the proxy route for rotation."))?;
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&route)?)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    match client.get(rotation_url).send().await {
+        Ok(res) => Ok(serde_json::json!({ "ok": res.status().is_success(), "status": res.status().as_u16() })),
+        Err(_) => Ok(serde_json::json!({ "ok": false, "error": "Rotation request failed." })),
+    }
+}
+
 /// A profile that is open right now.
 struct Running {
     child: std::process::Child,
@@ -802,7 +821,19 @@ impl Agent {
             // and for anybody polling without wanting the rest of `status`.
             "core.downloadStatus" => Ok(serde_json::to_value(&*self.core_download.lock().await)?),
 
-            "proxies.list" => Ok(serde_json::to_value(self.store.proxies().await?)?),
+            "proxies.list" => {
+                let proxies = self.store.proxies().await?;
+                let ids = proxies.iter().map(|proxy| proxy.id.clone()).collect::<Vec<_>>();
+                let rotation_ids = self.store.proxy_rotation_ids(&ids).await?;
+                let mut out = Vec::with_capacity(proxies.len());
+                for proxy in proxies {
+                    let has_rotation = rotation_ids.contains(&proxy.id);
+                    let mut value = serde_json::to_value(proxy)?;
+                    value["has_rotation"] = json!(has_rotation);
+                    out.push(value);
+                }
+                Ok(serde_json::to_value(out)?)
+            }
             // How big is it, and how much of that is throwaway.
             //
             // Profiles reach hundreds of megabytes and until now nothing showed
@@ -1327,8 +1358,12 @@ impl Agent {
             }
 
             "proxies.upsert" => {
+                let clear_rotation = params
+                    .get("clear_rotation")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 let proxy: Proxy = serde_json::from_value(params)?;
-                Ok(json!({ "id": self.store.upsert_proxy(&proxy).await? }))
+                Ok(json!({ "id": self.store.upsert_proxy_with_options(&proxy, clear_rotation).await? }))
             }
             // A pasted block from a supplier.
             //
@@ -1640,35 +1675,34 @@ impl Agent {
             // providers key rotation to the session that asks.
             "proxies.rotate" => {
                 let id = str_param(&params, "id")?;
-                let proxy = self
+                let (proxy, snapshot) = self
                     .store
-                    .proxies()
+                    .proxy_for_rotation(&id)
                     .await?
-                    .into_iter()
-                    .find(|p| p.id == id)
                     .ok_or_else(|| anyhow::anyhow!("no such proxy"))?;
-
                 let rotate = proxy
                     .rotate_url
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("this proxy has no rotation link")
-                    })?;
-
-                // Through a relay of our own, which stops when `_relay` goes at
-                // the end of this arm: reqwest cannot reach a WireGuard peer, and
-                // reads a password holding `#` or `/` as the end of the login.
-                let (route, _relay) = crate::relay::loopback(crate::parse_upstream(&proxy.url())?).await?;
-                let client = reqwest::Client::builder()
-                    .proxy(reqwest::Proxy::all(&route)?)
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()?;
-
-                match client.get(rotate).send().await {
-                    Ok(res) => Ok(json!({ "ok": res.status().is_success(), "status": res.status().as_u16() })),
-                    Err(e) => Ok(json!({ "ok": false, "error": format!("Rotation failed: {e}") })),
+                    .ok_or_else(|| anyhow::anyhow!("this proxy has no rotation link"))?;
+                let result = rotate_through_proxy(&proxy.url(), rotate).await?;
+                if result.get("ok").and_then(|v| v.as_bool()) == Some(true)
+                    && !self.store.clear_exit_after_rotation_if_current(&id, &snapshot).await?
+                {
+                    return Err(anyhow::anyhow!(
+                        "the proxy changed while it was rotating; check it again"
+                    ));
                 }
+                Ok(result)
+            }
+
+            // Team rotation has already opened its private URL in the native
+            // shell. The agent never stores or logs that URL; it only runs the
+            // bounded provider request through the supplied upstream.
+            "proxies.rotate_url" => {
+                let url = str_param(&params, "url")?;
+                let rotate_url = str_param(&params, "rotate_url")?;
+                rotate_through_proxy(&url, &rotate_url).await
             }
 
             "proxies.delete" => {
@@ -1698,17 +1732,24 @@ impl Agent {
                         matches!(entry.child.try_wait(), Ok(None)).then(|| id.clone())
                     })
                     .collect();
+                let proxy_ids = profiles
+                    .iter()
+                    .filter_map(|profile| profile.proxy.as_ref().map(|proxy| proxy.id.clone()))
+                    .collect::<Vec<_>>();
+                let rotation_ids = self.store.proxy_rotation_ids(&proxy_ids).await?;
                 // The list is the only place the shell learns what is open, so
                 // the answer has to come from the supervisor rather than from a
                 // flag in the database that a crash would leave stale.
-                let out: Vec<serde_json::Value> = profiles
-                    .drain(..)
-                    .map(|p| {
-                        let mut v = serde_json::to_value(&p).unwrap_or_default();
-                        v["running"] = json!(running.contains(&p.id));
-                        v
-                    })
-                    .collect();
+                let mut out = Vec::with_capacity(profiles.len());
+                for p in profiles.drain(..) {
+                    let proxy_id = p.proxy.as_ref().map(|proxy| proxy.id.clone());
+                    let mut v = serde_json::to_value(&p).unwrap_or_default();
+                    v["running"] = json!(running.contains(&p.id));
+                    if let Some(proxy_id) = proxy_id {
+                        v["proxy"]["has_rotation"] = json!(rotation_ids.contains(&proxy_id));
+                    }
+                    out.push(v);
+                }
                 Ok(serde_json::to_value(out)?)
             }
             "profiles.upsert" => {

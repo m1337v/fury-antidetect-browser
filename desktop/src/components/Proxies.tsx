@@ -10,7 +10,7 @@ import { useAsk } from "./Ask";
 import { ProxyForm, addedByMe, proxyLock } from "./ProxyForm";
 import { ProxyPaste } from "./ProxyPaste";
 import { PartnerCard } from "./Partner";
-import type { ProxyCheckState } from "../proxyCheck";
+import type { ProxyCheckState, ProxyRotationState } from "../proxyCheck";
 
 /** The proxies this machine knows about.
  *
@@ -24,8 +24,11 @@ export function Proxies({
   local,
   myEmail = null,
   canCheck,
+  canRotate,
   onCheckProxy,
   proxyCheckFor,
+  onRotateProxy,
+  proxyRotationFor,
   onProxySaved,
 }: {
   profiles: Profile[];
@@ -34,10 +37,15 @@ export function Proxies({
   /** Team proxy checks require the same organisation-wide secret permission
    *  as the sealed credential endpoint. */
   canCheck: boolean;
+  /** Rotation changes a shared proxy and is therefore limited to people who
+   *  may edit it, even though its saved URL is never revealed here. */
+  canRotate: boolean;
   /** The parent owns checks so a profile row and this table cannot run two
    *  requests for the same saved proxy. `true` means the stored exit changed. */
   onCheckProxy: (proxy: LocalProxy) => Promise<boolean>;
   proxyCheckFor: (proxy: LocalProxy) => ProxyCheckState | undefined;
+  onRotateProxy: (proxy: LocalProxy) => Promise<boolean>;
+  proxyRotationFor: (proxy: LocalProxy) => ProxyRotationState | undefined;
   /** A proxy edit makes any cached row-check outcome stale. */
   onProxySaved?: (id: string) => void;
 }) {
@@ -88,12 +96,35 @@ export function Proxies({
     if (changed) await load();
   };
 
+  const runRotation = async (proxy: LocalProxy) => {
+    try {
+      return await onRotateProxy(proxy);
+    } catch (e) {
+      setError(say(e));
+      return false;
+    }
+  };
+
+  const rotateOne = async (proxy: LocalProxy) => {
+    const rotated = await runRotation(proxy);
+    if (!rotated) return;
+    // The provider accepted the request, not proof that a new IP has appeared.
+    // Mirror the persisted metadata clear even if the following list request
+    // did not return, so this table never keeps showing the old checked exit.
+    setRows((saved) => saved.map((row) => row.id === proxy.id
+      ? { ...row, last_country: null, last_ip: null, last_timezone: null }
+      : row));
+  };
+
   const checkAll = async () => {
     if (!canCheck) return;
     // Do not enqueue a second request for an exit already being checked from a
     // profile row. The parent also deduplicates, this avoids misleading batch
     // progress for a request this button did not start.
-    const list = rows.filter((proxy) => proxyCheckFor(proxy)?.state !== "checking");
+    const list = rows.filter((proxy) => (
+      proxyCheckFor(proxy)?.state !== "checking"
+      && proxyRotationFor(proxy)?.state !== "rotating"
+    ));
     if (list.length === 0) return;
     setChecking({ done: 0, total: list.length });
     let done = 0;
@@ -185,71 +216,92 @@ export function Proxies({
               </tr>
             </thead>
             <tbody>
-              {rows.map((p) => (
-                <tr key={p.id}>
-                  <td>
-                    <div className="name">{p.name}</div>
-                    <div className="muted small">
-                      {p.kind}
-                      {p.added_by && <> · {addedByMe(p, myEmail) ? t("px.addedByYou") : t("px.addedBy", { who: p.added_by })}</>}
-                    </div>
-                  </td>
-                  <td className="mono">
-                    {p.host}:{p.port}
-                    {p.username && <div className="muted small">{p.username}</div>}
-                  </td>
-                  <td className="muted small">
-                    {p.last_ip ?? "—"}
-                    {p.last_country && (
-                      <>
-                        {" · "}
-                        <span className="flag">{flag(p.last_country)}</span> {p.last_country}
-                      </>
-                    )}
-                    {(() => {
-                      const check = proxyCheckFor(p);
-                      if (!check || check.state === "checking") return null;
-                      return check.state === "ok" ? (
+              {rows.map((p) => {
+                const check = proxyCheckFor(p);
+                const rotation = proxyRotationFor(p);
+                const operationPending = check?.state === "checking" || rotation?.state === "rotating";
+                const exitCleared = rotation?.accepted || rotation?.state === "ok";
+                const locked = proxyLock(p, myEmail, t);
+                const checkLabel = check?.state === "checking" ? t("px.checking") : t("px.check");
+                const checkTitle = check?.state === "ok"
+                  ? t("px.checkOk", { ms: check.ms ?? 0 })
+                  : check?.state === "error"
+                    ? check.error ?? t("px.checkBad")
+                    : checkLabel;
+                const rotationLabel = rotation?.state === "rotating" ? t("px.rotating") : t("px.rotateNow");
+                const rotationTitle = rotation?.state === "ok" || rotation?.accepted
+                  ? t("px.rotated")
+                  : rotation?.state === "error"
+                    ? rotation.error ?? t("px.checkBad")
+                    : rotationLabel;
+                return (
+                  <tr key={p.id}>
+                    <td>
+                      <div className="name">{p.name}</div>
+                      <div className="muted small">
+                        {p.kind}
+                        {p.added_by && <> · {addedByMe(p, myEmail) ? t("px.addedByYou") : t("px.addedBy", { who: p.added_by })}</>}
+                      </div>
+                    </td>
+                    <td className="mono">
+                      {p.host}:{p.port}
+                      {p.username && <div className="muted small">{p.username}</div>}
+                    </td>
+                    <td className="muted small">
+                      {exitCleared ? "—" : p.last_ip ?? "—"}
+                      {!exitCleared && p.last_country && (
+                        <>
+                          {" · "}
+                          <span className="flag">{flag(p.last_country)}</span> {p.last_country}
+                        </>
+                      )}
+                      {check && check.state !== "checking" && (check.state === "ok" ? (
                         <div className="ok">{t("px.checkOk", { ms: check.ms ?? 0 })}</div>
                       ) : (
                         <div className="warn" title={check.error}>{t("px.checkBad")}</div>
-                      );
-                    })()}
-                  </td>
-                  <td className="muted">
-                    {usedBy(p.id) === 0 ? "—" : t("px.usedByN", { n: usedBy(p.id) })}
-                  </td>
-                  <td className="actions">
-                    <div>
+                      ))}
+                      {rotation && rotation.state !== "rotating" && (rotation.state === "ok" ? (
+                        <div className="ok">{t("px.rotated")}</div>
+                      ) : (
+                        <div className="warn" title={rotation.error}>{t("px.checkBad")}</div>
+                      ))}
+                    </td>
+                    <td className="muted">
+                      {usedBy(p.id) === 0 ? "—" : t("px.usedByN", { n: usedBy(p.id) })}
+                    </td>
+                    <td className="actions">
+                      <div>
                       {/* Check is first because it describes the exit; editing
                           and deletion remain the table's ordinary actions. */}
-                      {canCheck && (() => {
-                        const check = proxyCheckFor(p);
-                        const label = check?.state === "checking" ? t("px.checking") : t("px.check");
-                        const title = check?.state === "ok"
-                          ? t("px.checkOk", { ms: check.ms ?? 0 })
-                          : check?.state === "error"
-                            ? check.error ?? t("px.checkBad")
-                            : label;
-                        return (
-                          <span className={`proxyTableCheck proxyCheck-${check?.state ?? "idle"}`}>
-                            <IconButton
-                              icon="check"
-                              label={label}
-                              title={title}
-                              disabled={check?.state === "checking"}
-                              onClick={() => void checkOne(p)}
-                            />
-                          </span>
-                        );
-                      })()}
+                      {canCheck && (
+                        <span className={`proxyTableCheck proxyCheck-${check?.state ?? "idle"}`}>
+                          <IconButton
+                            icon="check"
+                            label={checkLabel}
+                            title={checkTitle}
+                            disabled={operationPending}
+                            onClick={() => void checkOne(p)}
+                          />
+                        </span>
+                      )}
+                      {canRotate && p.has_rotation && locked === null && (
+                        <span className={`proxyTableRotate proxyRotate-${rotation?.state ?? "idle"}`}>
+                          <IconButton
+                            icon="refresh"
+                            label={rotationLabel}
+                            title={rotationTitle}
+                            disabled={operationPending}
+                            onClick={() => void rotateOne(p)}
+                          />
+                        </span>
+                      )}
                       <IconButton icon="pencil" label={t("row.edit")} onClick={() => setEditing(p)} />
                       <IconButton
                         icon="trash"
                         danger
                         label={t("row.delete")}
-                        title={proxyLock(p, myEmail, t) ?? undefined}
-                        disabled={proxyLock(p, myEmail, t) !== null}
+                        title={locked ?? undefined}
+                        disabled={locked !== null}
                         onClick={async () => {
                           const go = await ask({
                             title: t("row.delete"),
@@ -266,10 +318,11 @@ export function Proxies({
                           await load();
                         }}
                       />
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

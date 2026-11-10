@@ -9,7 +9,7 @@ import type { Me, Profile } from "../api";
 import { platformOf } from "../platform";
 import { assess } from "../consistency";
 import { isSuggested, statusHue } from "../status";
-import type { ProxyCheckState } from "../proxyCheck";
+import type { ProxyCheckState, ProxyRotationState } from "../proxyCheck";
 
 /** Every row's controls follow the permissions the SERVER resolved. Hiding a
  *  button is presentation, not protection — the server refuses regardless — but
@@ -66,6 +66,8 @@ export function ProfileTable({
   onEditProxy,
   onCheckProxy,
   proxyCheckFor,
+  onRotateProxy,
+  proxyRotationFor,
   onDelete,
   onExtensions,
   onShare,
@@ -98,6 +100,10 @@ export function ProfileTable({
    *  local and team proxies may have the same id. */
   onCheckProxy?: (p: Profile) => void;
   proxyCheckFor?: (p: Profile) => ProxyCheckState | undefined;
+  /** Asks a provider with a saved rotation link for a new exit. This is only
+   *  offered to people who may change that proxy; it never checks it after. */
+  onRotateProxy?: (p: Profile) => void;
+  proxyRotationFor?: (p: Profile) => ProxyRotationState | undefined;
   onDelete?: (p: Profile) => void;
   /** Extensions and disk usage — the two things beside the browser data. */
   onExtensions?: (p: Profile) => void;
@@ -230,6 +236,9 @@ export function ProfileTable({
           const canCheckProxy = p.origin === "local"
             ? canReveal
             : me?.role === "owner" || me?.role === "admin";
+          const canRotateProxy = !!p.proxy?.has_rotation
+            && canEditProxy
+            && (p.origin === "local" || me?.role === "owner" || me?.role === "admin");
           const locked = p.lock !== null;
           const open = isOpenHere(p, { local, userId: me?.user_id, machine: thisMachine });
           const starting = launching?.has(p.id) ?? false;
@@ -250,12 +259,20 @@ export function ProfileTable({
             p.proxy && shared >= 2 ? t("row.sharedExit", { n: shared }) : "",
           ].filter(Boolean).join(" · ");
           const proxyCheck = p.proxy ? proxyCheckFor?.(p) : undefined;
+          const proxyRotation = p.proxy ? proxyRotationFor?.(p) : undefined;
+          const proxyOperationPending = proxyCheck?.state === "checking" || proxyRotation?.state === "rotating";
           const checkLabel = proxyCheck?.state === "checking" ? t("px.checking") : t("px.check");
           const checkTitle = proxyCheck?.state === "ok"
             ? t("px.checkOk", { ms: proxyCheck.ms ?? 0 })
             : proxyCheck?.state === "error"
               ? proxyCheck.error ?? t("px.checkBad")
               : checkLabel;
+          const rotationLabel = proxyRotation?.state === "rotating" ? t("px.rotating") : t("px.rotateNow");
+          const rotationTitle = proxyRotation?.state === "ok" || proxyRotation?.accepted
+            ? t("px.rotated")
+            : proxyRotation?.state === "error"
+              ? proxyRotation.error ?? t("px.checkBad")
+              : rotationLabel;
 
           return (
             <tr key={p.id} data-row className={selected.has(p.id) ? "picked" : undefined}>
@@ -344,8 +361,22 @@ export function ProfileTable({
                             icon="check"
                             label={checkLabel}
                             title={checkTitle}
-                            disabled={proxyCheck?.state === "checking"}
+                            disabled={proxyOperationPending}
                             onClick={() => onCheckProxy(p)}
+                          />
+                        </span>
+                      )}
+                      {onRotateProxy && canRotateProxy && (
+                        <span
+                          className={`proxyRotate proxyRotate-${proxyRotation?.state ?? "idle"}`}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <IconButton
+                            icon="refresh"
+                            label={rotationLabel}
+                            title={rotationTitle}
+                            disabled={proxyOperationPending}
+                            onClick={() => onRotateProxy(p)}
                           />
                         </span>
                       )}

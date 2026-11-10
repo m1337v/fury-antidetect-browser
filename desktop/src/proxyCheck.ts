@@ -9,4 +9,13 @@ export type ProxyCheckState = {
   error?: string;
 };
 
+/** Rotation asks the provider to issue a new exit. It intentionally does not
+ *  claim that the exit changed: only a later manual check can establish that. */
+export type ProxyRotationState = {
+  state: "rotating" | "ok" | "error";
+  /** The provider accepted the request, but row metadata is still refreshing. */
+  accepted?: boolean;
+  error?: string;
+};
+
 export const proxyCheckKey = (origin: "local" | "team", id: string) => `${origin}:${id}`;

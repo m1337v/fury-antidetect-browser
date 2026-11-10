@@ -171,6 +171,33 @@ pub fn seal_proxy_credentials(
     Ok((keys::wrap(&dek, &plain), keys::wrap(org_key, &dek)))
 }
 
+/// Open a provider rotation URL using the same per-proxy data key as its
+/// credentials. Keeping both under that key means organisation-key rotation
+/// remains a cheap re-wrap and a stolen database has neither secret.
+pub fn open_proxy_rotation_url(
+    org_key: &[u8; 32],
+    rotate_url_enc: &[u8],
+    wrapped_dek: &[u8],
+) -> anyhow::Result<String> {
+    let dek = key32("the proxy data key", keys::unwrap(org_key, wrapped_dek)?)?;
+    Ok(String::from_utf8(keys::unwrap(&dek, rotate_url_enc)?)?)
+}
+
+/// Seal a provider rotation URL under an existing proxy data key. This is used
+/// when a credential edit creates a fresh data key and must retain its saved
+/// provider link rather than leaving ciphertext that no key can open.
+pub fn seal_proxy_rotation_url(
+    org_key: &[u8; 32],
+    rotate_url: &str,
+    wrapped_dek: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    if rotate_url.trim().is_empty() {
+        anyhow::bail!("a rotation URL cannot be blank");
+    }
+    let dek = key32("the proxy data key", keys::unwrap(org_key, wrapped_dek)?)?;
+    Ok(keys::wrap(&dek, rotate_url.as_bytes()))
+}
+
 /// A login sealed for the server: the blob, and the data key that opens it.
 ///
 /// Same construction as a proxy's credentials and for the same reason. A fresh

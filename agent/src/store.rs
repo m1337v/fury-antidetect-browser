@@ -119,6 +119,15 @@ pub struct ProxyCheckSnapshot {
     password: Option<String>,
 }
 
+/// A saved rotation request has the same stale-write boundary as a check, plus
+/// its sealed provider URL. That URL never leaves the store except opened for
+/// the in-process provider request.
+#[derive(Clone)]
+pub struct ProxyRotationSnapshot {
+    check: ProxyCheckSnapshot,
+    rotate_url: Option<String>,
+}
+
 impl Proxy {
     /// The upstream URL the relay takes.
     pub fn url(&self) -> String {
@@ -619,7 +628,71 @@ impl Store {
         }))
     }
 
+    /// Open one saved proxy and keep a raw snapshot that can clear a prior
+    /// exit only if neither the upstream nor its provider rotation link moved
+    /// while that request was in flight.
+    pub async fn proxy_for_rotation(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<(Proxy, ProxyRotationSnapshot)>> {
+        let row = sqlx::query(
+            "SELECT id, name, kind, host, port, username, password, last_country, last_ip, \
+                    last_timezone, rotate_url, checker_url \
+             FROM proxies WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| {
+            let snapshot = ProxyRotationSnapshot {
+                check: ProxyCheckSnapshot {
+                    kind: row.get("kind"),
+                    host: row.get("host"),
+                    port: row.get("port"),
+                    username: row.get("username"),
+                    password: row.get("password"),
+                },
+                rotate_url: row.get("rotate_url"),
+            };
+            (self.open_proxy(row_to_proxy(&row)), snapshot)
+        }))
+    }
+
+    /// Provider rotation links for an already-listed set of proxies. Read raw
+    /// values so a locked keychain cannot turn a saved link into a false
+    /// negative, and fetch the whole list in one query rather than one query
+    /// per polled profile row.
+    pub async fn proxy_rotation_ids(
+        &self,
+        ids: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let slots = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id FROM proxies WHERE deleted_at IS NULL \
+             AND rotate_url IS NOT NULL AND rotate_url != '' AND id IN ({slots})"
+        );
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        Ok(query.fetch_all(&self.pool).await?.into_iter().collect())
+    }
+
     pub async fn upsert_proxy(&self, p: &Proxy) -> anyhow::Result<String> {
+        self.upsert_proxy_with_options(p, false).await
+    }
+
+    /// Save a local proxy without making a blank rotation field destructive.
+    /// `clear_rotation` is an explicit user choice and participates in the
+    /// same transaction as the rest of the proxy edit.
+    pub async fn upsert_proxy_with_options(
+        &self,
+        p: &Proxy,
+        clear_rotation: bool,
+    ) -> anyhow::Result<String> {
         let id = if p.id.is_empty() { new_id() } else { p.id.clone() };
         // A secret this machine cannot open right now was shown to the form as
         // blank, and the form sends the blank back. Writing it would turn "the
@@ -675,7 +748,17 @@ impl Store {
             }
         };
         let password = secret(p.password.as_deref(), old_password);
-        let rotate_url = secret(p.rotate_url.as_deref(), old_rotate);
+        let rotate_url = if clear_rotation {
+            None
+        } else {
+            match p.rotate_url.as_deref().filter(|value| !value.is_empty()) {
+                Some(rotation_url) => secret(Some(rotation_url), old_rotate),
+                // The editor deliberately cannot distinguish an absent field
+                // from a blank one reliably across older IPC callers. Both
+                // preserve a link; removal is the explicit flag above.
+                None => old_rotate,
+            }
+        };
         let configuration_changed = !p.id.is_empty()
             && (old_kind != p.kind
                 || old_host != p.host
@@ -857,6 +940,33 @@ impl Store {
         .bind(snapshot.port)
         .bind(&snapshot.username)
         .bind(&snapshot.password)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// A successful provider rotation request invalidates the prior exit
+    /// observation. Preserve a concurrent configuration edit rather than
+    /// clearing a newer saved proxy's observation.
+    pub async fn clear_exit_after_rotation_if_current(
+        &self,
+        proxy_id: &str,
+        snapshot: &ProxyRotationSnapshot,
+    ) -> anyhow::Result<bool> {
+        let check = &snapshot.check;
+        let updated = sqlx::query(
+            "UPDATE proxies SET last_ip = NULL, last_country = NULL, last_timezone = NULL, \
+                    last_location = NULL, checked_at = NULL \
+             WHERE id = ? AND deleted_at IS NULL AND kind = ? AND host = ? AND port = ? \
+                   AND username IS ? AND password IS ? AND rotate_url IS ?",
+        )
+        .bind(proxy_id)
+        .bind(&check.kind)
+        .bind(&check.host)
+        .bind(check.port)
+        .bind(&check.username)
+        .bind(&check.password)
+        .bind(&snapshot.rotate_url)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
