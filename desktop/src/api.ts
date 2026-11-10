@@ -42,6 +42,10 @@ export interface ProxySummary {
    *  Never masked in local mode — there is nobody to hide it from. */
   display: string;
   country: string | null;
+  /** Exit address observed by the last successful proxy check, not the
+   * configured endpoint. Missing from older team servers and callers without
+   * permission to reveal proxy details. */
+  last_ip?: string | null;
   /** The exit's zone from the last check, if any — what "follow the exit" resolves to. */
   last_timezone?: string | null;
 }

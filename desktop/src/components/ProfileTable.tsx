@@ -62,6 +62,7 @@ export function ProfileTable({
   onLaunch,
   onStop,
   onEdit,
+  onEditProxy,
   onDelete,
   onExtensions,
   onShare,
@@ -86,6 +87,10 @@ export function ProfileTable({
   /** Local mode only: with a server, editing belongs where the permissions
    *  live, and that screen does not exist yet. */
   onEdit?: (p: Profile) => void;
+  /** Opens this profile's editor directly on Proxy. Changing an assignment
+   *  needs both profile and proxy-edit permission, so this stays absent for a
+   *  member who may inspect the profile but not reroute it. */
+  onEditProxy?: (p: Profile) => void;
   onDelete?: (p: Profile) => void;
   /** Extensions and disk usage — the two things beside the browser data. */
   onExtensions?: (p: Profile) => void;
@@ -207,9 +212,10 @@ export function ProfileTable({
         {visible.map((p) => {
           const canLaunch = p.permissions.includes("launch");
           const canForce = p.permissions.includes("manage_access");
-          const canReveal = p.permissions.includes("reveal_secrets");
           const canDelete = p.permissions.includes("delete_profile");
           const canEdit = p.permissions.includes("edit_profile");
+          const canEditProxy = canEdit && p.permissions.includes("edit_proxy");
+          const canReveal = p.permissions.includes("reveal_secrets");
           const locked = p.lock !== null;
           const open = isOpenHere(p, { local, userId: me?.user_id, machine: thisMachine });
           const starting = launching?.has(p.id) ?? false;
@@ -219,6 +225,16 @@ export function ProfileTable({
           const shared = sharing?.get(p.id) ?? 0;
           const verdict = assess(p, personas ?? null, shared);
           const verdictText = verdict.notes.map((n) => t(n.key, n.vars)).join(" · ");
+          // A rotating provider's configured host and the address a site saw
+          // are intentionally different values. The latter is sensitive like
+          // the former, and the server omits it without this permission; the
+          // client gate defends the older-server path too.
+          const exitIp = canReveal ? p.proxy?.last_ip : null;
+          const proxyTitle = [
+            p.proxy && onNetwork ? t("net.current") : "",
+            p.proxy && !canReveal ? t("row.masked") : "",
+            p.proxy && shared >= 2 ? t("row.sharedExit", { n: shared }) : "",
+          ].filter(Boolean).join(" · ");
 
           return (
             <tr key={p.id} data-row className={selected.has(p.id) ? "picked" : undefined}>
@@ -292,40 +308,29 @@ export function ProfileTable({
               )}
               <td
                 className={p.proxy && onNetwork ? "clickable" : undefined}
-                title={p.proxy && onNetwork ? t("net.current") : undefined}
+                title={proxyTitle || undefined}
                 onClick={() => p.proxy && onNetwork?.(p)}
               >
                 {p.proxy ? (
-                  <>
-                    <div className="mono">{p.proxy.display}</div>
-                    {/* A country appears once the proxy has been checked. Until
-                        then the line says so — it used to render a bare "?",
-                        which reads as a broken value rather than a fact not yet
-                        known. */}
-                    <div className="muted small">
-                      {p.proxy.country ? (
-                        <>
-                          <span className="flag">{flag(p.proxy.country)}</span> {p.proxy.country}
-                        </>
-                      ) : (
-                        t("row.proxyUnchecked")
-                      )}
-                      {/* The server masks the host for anyone without
-                          reveal_secrets; say so, or a masked value reads like a
-                          bug rather than a boundary. */}
-                      {!canReveal && ` · ${t("row.masked")}`}
-                      {/* How many profiles a site sees from this exit (docs/12 C).
-                          Said from two; coloured from three. */}
-                      {shared >= 2 && (
-                        <span className={shared >= 3 ? "warn" : undefined}> · {t("row.sharedExit", { n: shared })}</span>
+                  <div className="proxyCell">
+                    <div className="proxyLabelRow">
+                      <div className="proxyLabel" title={p.proxy.name}>
+                        {p.proxy.name || p.proxy.display}
+                      </div>
+                      {onEditProxy && canEditProxy && (
+                        <span className="proxyEdit" onClick={(e) => e.stopPropagation()}>
+                          <IconButton icon="pencil" label={t("px.edit")} disabled={busy} onClick={() => onEditProxy(p)} />
+                        </span>
                       )}
                     </div>
-                    {p.proxy.name && (
-                      <div className="proxyLabel" title={p.proxy.name}>
-                        {p.proxy.name}
+                    {(p.proxy.country || exitIp) && (
+                      <div className="proxyExit muted small">
+                        {p.proxy.country && <><span className="flag">{flag(p.proxy.country)}</span> {p.proxy.country}</>}
+                        {p.proxy.country && exitIp && " · "}
+                        {exitIp && <span className="mono">{exitIp}</span>}
                       </div>
                     )}
-                  </>
+                  </div>
                 ) : (
                   // Not cosmetic: the agent refuses to launch without one,
                   // unless this profile has been given permission — and then

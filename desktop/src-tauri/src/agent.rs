@@ -58,6 +58,10 @@ pub struct LocalProxy {
     pub host: String,
     pub port: u16,
     pub last_country: Option<String>,
+    /// Exit address from the last successful local proxy check. This is not
+    /// necessarily the configured host for a rotating proxy provider.
+    #[serde(default)]
+    pub last_ip: Option<String>,
     /// The exit's zone from the last check, for the editor to name what
     /// "follow the exit" will resolve to.
     #[serde(default)]

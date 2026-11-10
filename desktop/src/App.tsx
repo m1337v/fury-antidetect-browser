@@ -143,6 +143,7 @@ export function App() {
     return () => clearInterval(every);
   }, []);
   const [editing, setEditing] = useState<Profile | null | undefined>(undefined);
+  const [editingTab, setEditingTab] = useState<"General" | "Proxy">("General");
   const [query, setQuery] = useState("");
   const [tag, setTag] = useState("");
   // The stage filter (5.5): "" is every stage, "\u0000none" is no stage.
@@ -1706,7 +1707,14 @@ export function App() {
               launching={launching}
               onLaunch={onLaunch}
               onStop={onStop}
-              onEdit={setEditing}
+              onEdit={(p) => {
+                setEditingTab("General");
+                setEditing(p);
+              }}
+              onEditProxy={(p) => {
+                setEditingTab("Proxy");
+                setEditing(p);
+              }}
               onExtensions={setExtFor}
               onShare={local ? undefined : (p) => setSharing([p])}
               onNetwork={setNetFor}
@@ -1795,11 +1803,16 @@ export function App() {
             projectId={active?.id ?? null}
             teamProjects={projects.filter((p) => p.origin === "team")}
             editing={editing}
+            initialTab={editingTab}
             origin={newOrigin}
             canChoose={canChooseOrigin}
-            onClose={() => setEditing(undefined)}
+            onClose={() => {
+              setEditing(undefined);
+              setEditingTab("General");
+            }}
             onSaved={async () => {
               setEditing(undefined);
+              setEditingTab("General");
               await load();
               await refreshProfiles();
             }}

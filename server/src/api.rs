@@ -1209,18 +1209,36 @@ pub(crate) async fn profiles_in(
 
     let reveal = perms.has(Perm::RevealSecrets);
 
-    let rows: Vec<(
-        Uuid, String, Vec<String>, String, i32,
-        Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>,
-        Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>,
-        String,
-    )> = sqlx::query_as(
+    #[derive(sqlx::FromRow)]
+    struct ProfileListRow {
+        id: Uuid,
+        name: String,
+        tags: Vec<String>,
+        persona_id: String,
+        current_version: i32,
+        proxy_id: Option<Uuid>,
+        proxy_name: Option<String>,
+        proxy_kind: Option<String>,
+        proxy_host: Option<String>,
+        proxy_country: Option<String>,
+        proxy_last_ip: Option<String>,
+        lock_user: Option<Uuid>,
+        lock_email: Option<String>,
+        lock_machine: Option<String>,
+        lock_acquired: Option<String>,
+        lock_expires: Option<String>,
+        project_name: String,
+    }
+
+    let rows: Vec<ProfileListRow> = sqlx::query_as(
         &format!(
             r#"
         SELECT f.id, f.name, f.tags, f.persona_id, f.current_version,
-               x.id, x.name, x.kind::text, x.host || ':' || x.port, x.last_country,
-               l.user_id, u.email, l.machine_name,
-               {acquired}, {expires}, p.name
+               x.id AS proxy_id, x.name AS proxy_name, x.kind::text AS proxy_kind,
+               x.host || ':' || x.port AS proxy_host, x.last_country AS proxy_country,
+               host(x.last_ip) AS proxy_last_ip,
+               l.user_id AS lock_user, u.email AS lock_email, l.machine_name AS lock_machine,
+               {acquired} AS lock_acquired, {expires} AS lock_expires, p.name AS project_name
         FROM profiles f
         JOIN projects p ON p.id = f.project_id
         LEFT JOIN proxies x ON x.id = f.proxy_id AND x.deleted_at IS NULL
@@ -1240,16 +1258,15 @@ pub(crate) async fn profiles_in(
     let out = rows
         .into_iter()
         .map(
-            |(
+            |ProfileListRow {
                 id, name, tags, persona_id, current_version,
-                proxy_id, proxy_name, proxy_kind, proxy_host, proxy_country,
+                proxy_id, proxy_name, proxy_kind, proxy_host, proxy_country, proxy_last_ip,
                 lock_user, lock_email, lock_machine, lock_acquired, lock_expires,
                 project_name,
-            )| {
+            }| {
                 ProfileSummary {
-                    // Filled in below: the row above is already at sqlx's
-                    // sixteen-column limit for tuples, and one more would have
-                    // meant a named struct for a single integer.
+                    // The secondary page-wide fields are filled in below, so
+                    // this listing remains one query rather than one per row.
                     shared_with: 0,
                     bundle_bytes: None,
                     notes: String::new(),
@@ -1285,6 +1302,11 @@ pub(crate) async fn profiles_in(
                             (None, _) => String::new(),
                         },
                         country: proxy_country,
+                        // The check records an exit, which may not be the proxy
+                        // endpoint for a rotating gateway. Treat it like the
+                        // endpoint: do not hand it to a caller without the
+                        // permission to reveal proxy details.
+                        last_ip: reveal.then_some(proxy_last_ip).flatten(),
                         detected_kind: None,
                         last_checked_at: None,
                         shared_with_profiles: 0,
@@ -2294,7 +2316,7 @@ struct AuditEntry {
 /// One row of `list_proxies_sql`.
 pub(crate) type ProxyRow = (
     Uuid, String, String, String, i32, Option<String>, Option<String>, Option<String>, i64,
-    Option<Uuid>, Option<String>,
+    Option<Uuid>, Option<String>, Option<String>,
 );
 
 /// The organisation's proxies, with who added each, as SQL. A function so a
@@ -2304,7 +2326,7 @@ pub(crate) fn list_proxies_sql() -> String {
         "SELECT x.id, x.name, x.kind::text, x.host, x.port, x.last_country, \
                 x.last_kind_detected, {}, \
                 (SELECT count(*) FROM profiles f WHERE f.proxy_id = x.id AND f.deleted_at IS NULL), \
-                x.created_by, u.email \
+                x.created_by, u.email, host(x.last_ip) \
          FROM proxies x LEFT JOIN users u ON u.id = x.created_by \
          WHERE x.org_id = $1 AND x.deleted_at IS NULL \
          ORDER BY x.name",
@@ -2339,7 +2361,7 @@ async fn list_proxies(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, name, kind, host, port, country, detected, checked, used, author, author_email)| ProxySummary {
+            .map(|(id, name, kind, host, port, country, detected, checked, used, author, author_email, last_ip)| ProxySummary {
                 id,
                 name,
                 kind,
@@ -2353,6 +2375,7 @@ async fn list_proxies(
                     format!("{}:{port}", mask_host(&host))
                 },
                 country,
+                last_ip: reveal.then_some(last_ip).flatten(),
                 detected_kind: detected,
                 last_checked_at: checked,
                 shared_with_profiles: used,

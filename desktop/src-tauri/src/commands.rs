@@ -1178,6 +1178,11 @@ pub struct UiProxy {
     /// hide it from and the operator has to be able to check what they typed.
     pub display: String,
     pub country: Option<String>,
+    /// Exit address from the last successful check. Unlike `display`, this is
+    /// not the configured gateway and can therefore differ for rotating proxy
+    /// providers. Omitted by a server when the caller may not reveal it.
+    #[serde(default)]
+    pub last_ip: Option<String>,
     /// From the last exit check, when there was one.
     #[serde(default)]
     pub last_timezone: Option<String>,
@@ -1319,6 +1324,7 @@ async fn local_profiles() -> R<Vec<UiProfile>> {
             proxy: p.proxy.map(|x| UiProxy {
                 display: format!("{}:{}", x.host, x.port),
                 country: x.last_country,
+                last_ip: x.last_ip,
                 last_timezone: x.last_timezone,
                 id: x.id,
                 name: x.name,
@@ -1371,6 +1377,7 @@ pub async fn profiles(
                 proxy: p.proxy.map(|x| UiProxy {
                     display: format!("{}:{}", x.host, x.port),
                     country: x.last_country,
+                    last_ip: x.last_ip,
                     last_timezone: None,
                     id: x.id,
                     name: x.name,
@@ -1418,6 +1425,7 @@ pub async fn profiles(
                 proxy: p.proxy.map(|x| UiProxy {
                     display: format!("{}:{}", x.host, x.port),
                     country: x.last_country,
+                    last_ip: x.last_ip,
                     last_timezone: None,
                     id: x.id,
                     name: x.name,
@@ -1487,6 +1495,7 @@ pub async fn profiles(
                 kind: x.kind,
                 display: x.display,
                 country: x.country,
+                last_ip: x.last_ip,
                 last_timezone: None,
             }),
             permissions: p.permissions.iter().map(|v| perm_name(v)).collect(),
@@ -2526,7 +2535,7 @@ pub async fn proxies(
                     "username": serde_json::Value::Null,
                     "password": serde_json::Value::Null,
                     "last_country": p.country,
-                    "last_ip": serde_json::Value::Null,
+                    "last_ip": p.last_ip,
                     "rotate_url": serde_json::Value::Null,
                     "checker_url": serde_json::Value::Null,
                     "shared_with_profiles": p.shared_with_profiles,
@@ -2973,6 +2982,7 @@ pub async fn trash(state: State<'_, AppState>) -> R<Vec<UiProfile>> {
             proxy: p.proxy.map(|x| UiProxy {
                 display: format!("{}:{}", x.host, x.port),
                 country: x.last_country,
+                last_ip: x.last_ip,
                 last_timezone: None,
                 id: x.id,
                 name: x.name,
@@ -4268,6 +4278,7 @@ pub async fn shared_with_me(state: State<'_, AppState>) -> R<Vec<UiProfile>> {
                 kind: String::new(),
                 display,
                 country: None,
+                last_ip: None,
                 last_timezone: None,
             }),
             timezone: None,

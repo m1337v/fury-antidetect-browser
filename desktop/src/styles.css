@@ -337,6 +337,35 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.proxyLabelRow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.proxyLabelRow .proxyLabel {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* The pencil is an occasional action. Keep it out of the scanning path, but
+   reveal it both on pointer hover and when tab focus reaches the real button. */
+.proxyEdit {
+  flex: none;
+  opacity: 0;
+}
+
+.proxyCell:hover .proxyEdit,
+.proxyCell:focus-within .proxyEdit {
+  opacity: 1;
+}
+
+.proxyEdit button.icon {
+  width: 22px;
+  height: 22px;
+}
+
 .tags {
   display: flex;
   flex-wrap: wrap;

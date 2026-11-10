@@ -151,6 +151,7 @@ export function ProfileDialog({
   projectId,
   teamProjects,
   editing,
+  initialTab = "General",
   origin,
   canChoose,
   onClose,
@@ -163,6 +164,8 @@ export function ProfileDialog({
    *  profile is made with none open. */
   teamProjects: Project[];
   editing: Profile | null;
+  /** A row affordance may open a saved profile directly where its action is. */
+  initialTab?: Tab;
   /** Where a NEW profile is made: the open project's world, or the shell's
    *  when no project is open. A team profile has to have a proxy, so the
    *  dialog has to know, to say so before the button. It used to be the
@@ -179,7 +182,7 @@ export function ProfileDialog({
   const { t, say } = useI18n();
   // The interface language, for naming languages in it.
   const lang = document.documentElement.lang || "en";
-  const [tab, setTab] = useState<Tab>("General");
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [where, setWhere] = useState<"local" | "team">(origin);
   // The world this profile lives in, or will: an existing one keeps its own.
   const target = editing ? editing.origin : where;
