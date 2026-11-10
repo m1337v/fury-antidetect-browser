@@ -320,6 +320,11 @@ export function ProfileTable({
                         <span className={shared >= 3 ? "warn" : undefined}> · {t("row.sharedExit", { n: shared })}</span>
                       )}
                     </div>
+                    {p.proxy.name && (
+                      <div className="proxyLabel" title={p.proxy.name}>
+                        {p.proxy.name}
+                      </div>
+                    )}
                   </>
                 ) : (
                   // Not cosmetic: the agent refuses to launch without one,
