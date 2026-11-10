@@ -102,6 +102,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             axum::routing::patch(edit_proxy).delete(delete_proxy),
         )
         .route("/v1/proxies/{proxy_id}/credentials", get(reveal_proxy))
+        .route("/v1/proxies/{proxy_id}/check", post(record_proxy_check))
         .route(
             "/v1/profiles/{profile_id}",
             axum::routing::patch(edit_profile).delete(delete_profile),
@@ -2748,14 +2749,23 @@ async fn edit_proxy(
     // sends back what it showed. Written, it turned a renamed proxy into one
     // that dials "***1a2b.provider.net". The mask of the stored host means
     // "unchanged".
-    let stored_host: Option<String> =
-        sqlx::query_scalar("SELECT host FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL")
-            .bind(proxy_id)
-            .bind(caller.org_id)
-            .fetch_optional(db.as_mut())
-            .await?;
-    let host = match stored_host {
-        Some(stored) if req.host.trim() == mask_host(&stored) => stored,
+    // Serialise this comparison with both another edit and a completed check.
+    // Otherwise an edit queued behind another configuration change could retain
+    // that newer configuration's check while restoring the old endpoint.
+    let mut tx = db.begin().await?;
+    let stored: Option<(String, String, i32)> = sqlx::query_as(
+        "SELECT kind::text, host, port FROM proxies \
+         WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((stored_kind, stored_host, stored_port)) = stored else {
+        return Err(ApiError::NotFound);
+    };
+    let host = match &stored_host {
+        stored if req.host.trim() == mask_host(stored) => stored.clone(),
         _ => req.host.trim().to_string(),
     };
 
@@ -2778,11 +2788,25 @@ async fn edit_proxy(
         }
     };
 
+    // An exit describes one exact upstream. A label correction leaves the
+    // observation useful; changing where or how it dials does not. Clear it in
+    // the same statement that changes the configuration, so a list can never
+    // temporarily claim a previous endpoint's exit for a new one.
+    let configuration_changed = stored_kind != req.kind
+        || stored_host != host
+        || stored_port != req.port
+        || credentials.is_some();
+
     let updated = match credentials {
         Some((c, d)) => {
             sqlx::query(
                 "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4, \
-                        credentials_enc = $5, wrapped_dek = $6 \
+                        credentials_enc = $5, wrapped_dek = $6, \
+                        last_ip = CASE WHEN $9 THEN NULL ELSE last_ip END, \
+                        last_country = CASE WHEN $9 THEN NULL ELSE last_country END, \
+                        last_timezone = CASE WHEN $9 THEN NULL ELSE last_timezone END, \
+                        last_checked_at = CASE WHEN $9 THEN NULL ELSE last_checked_at END, \
+                        last_error = CASE WHEN $9 THEN NULL ELSE last_error END \
                  WHERE id = $7 AND org_id = $8 AND deleted_at IS NULL",
             )
             .bind(req.name.trim())
@@ -2793,12 +2817,18 @@ async fn edit_proxy(
             .bind(&d)
             .bind(proxy_id)
             .bind(caller.org_id)
-            .execute(db.as_mut())
+            .bind(configuration_changed)
+            .execute(&mut *tx)
             .await?
         }
         None => {
             sqlx::query(
-                "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4 \
+                "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4, \
+                        last_ip = CASE WHEN $7 THEN NULL ELSE last_ip END, \
+                        last_country = CASE WHEN $7 THEN NULL ELSE last_country END, \
+                        last_timezone = CASE WHEN $7 THEN NULL ELSE last_timezone END, \
+                        last_checked_at = CASE WHEN $7 THEN NULL ELSE last_checked_at END, \
+                        last_error = CASE WHEN $7 THEN NULL ELSE last_error END \
                  WHERE id = $5 AND org_id = $6 AND deleted_at IS NULL",
             )
             .bind(req.name.trim())
@@ -2807,7 +2837,8 @@ async fn edit_proxy(
             .bind(req.port)
             .bind(proxy_id)
             .bind(caller.org_id)
-            .execute(db.as_mut())
+            .bind(configuration_changed)
+            .execute(&mut *tx)
             .await?
         }
     };
@@ -2815,8 +2846,9 @@ async fn edit_proxy(
         return Err(ApiError::NotFound);
     }
 
-    audit(db.as_mut(), &caller, "proxy.edit", Some(proxy_id),
-          json!({ "credentials_changed": req.credentials_enc.is_some() })).await?;
+    audit(&mut *tx, &caller, "proxy.edit", Some(proxy_id),
+          json!({ "credentials_changed": req.credentials_enc.is_some(), "configuration_changed": configuration_changed })).await?;
+    tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2866,7 +2898,113 @@ async fn reveal_proxy(
         "port": port,
         "credentials_enc": hex(&credentials_enc),
         "wrapped_dek": hex(&wrapped_dek),
+        // An opaque snapshot of the exact upstream this machine checks. It is
+        // returned with the already-authorised sealed credentials, never to the
+        // webview, then compared while the result is stored. A late answer must
+        // not describe a proxy somebody has since edited.
+        "check_version": proxy_check_version(&kind, &host, port, &credentials_enc, &wrapped_dek),
     })))
+}
+
+/// A stable, opaque name for the complete upstream configuration. Lengths make
+/// the input unambiguous without putting passwords or ciphertext in a URL or
+/// audit record.
+fn proxy_check_version(kind: &str, host: &str, port: i32, credentials: &[u8], dek: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"fury-proxy-check-v1");
+    let port = port.to_be_bytes();
+    for part in [kind.as_bytes(), host.as_bytes(), port.as_slice(), credentials, dek] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Deserialize)]
+struct ProxyCheckRequest {
+    check_version: String,
+    ip: String,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+fn valid_timezone_shape(timezone: &str) -> bool {
+    // The server deliberately has no tzdata dependency: it is an authority for
+    // permissions and storage, not a locale resolver. Keep arbitrary text and
+    // control characters out while accepting the IANA-shaped identifiers a
+    // configurable checker returns (for example Europe/Berlin or Etc/GMT+1).
+    timezone.len() <= 128
+        && timezone.contains('/')
+        && timezone.split('/').all(|part| {
+            !part.is_empty()
+                && part.len() <= 64
+                && part.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'+'))
+        })
+}
+
+/// Persist a successful check run on an operator's machine. The server cannot
+/// run the check itself: it has neither the organisation key nor the operator's
+/// network path. It can validate and atomically attach the observation to the
+/// precise configuration that was checked.
+async fn record_proxy_check(
+    mut db: auth::Db,
+    Path(proxy_id): Path<Uuid>,
+    Json(req): Json<ProxyCheckRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !caller.implicit_permissions().has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+    if req.check_version.len() != 64 || !req.check_version.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("the proxy check is missing its configuration version".into()));
+    }
+    let ip = req
+        .ip
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| ApiError::BadRequest("the checker did not return a valid IP address".into()))?;
+    let country = req.country.map(|country| country.trim().to_ascii_uppercase()).filter(|country| !country.is_empty());
+    if country.as_deref().is_some_and(|country| country.len() != 2 || !country.bytes().all(|c| c.is_ascii_alphabetic())) {
+        return Err(ApiError::BadRequest("the checker returned an invalid country code".into()));
+    }
+    let timezone = req.timezone.map(|timezone| timezone.trim().to_string()).filter(|timezone| !timezone.is_empty());
+    if timezone.as_deref().is_some_and(|timezone| !valid_timezone_shape(timezone)) {
+        return Err(ApiError::BadRequest("the checker returned an invalid timezone".into()));
+    }
+
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String, i32, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT kind::text, host, port, credentials_enc, wrapped_dek \
+         FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((kind, host, port, Some(credentials), Some(dek))) = row else {
+        return Err(ApiError::NotFound);
+    };
+    if req.check_version != proxy_check_version(&kind, &host, port, &credentials, &dek) {
+        return Err(ApiError::Conflict("the proxy changed while it was being checked; run the check again".into()));
+    }
+    sqlx::query(
+        "UPDATE proxies SET last_ip = $1::inet, last_country = $2, last_timezone = $3, \
+                            last_checked_at = now(), last_error = NULL \
+         WHERE id = $4 AND org_id = $5 AND deleted_at IS NULL",
+    )
+    .bind(ip.to_string())
+    .bind(country)
+    .bind(timezone)
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .execute(&mut *tx)
+    .await?;
+    audit(&mut *tx, &caller, "proxy.check", Some(proxy_id), json!({})).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// Retire a proxy.

@@ -10,7 +10,7 @@ import { useAsk } from "./Ask";
 import { ProxyForm, addedByMe, proxyLock } from "./ProxyForm";
 import { ProxyPaste } from "./ProxyPaste";
 import { PartnerCard } from "./Partner";
-import { proxyUrl } from "../proxyUrl";
+import type { ProxyCheckState } from "../proxyCheck";
 
 /** The proxies this machine knows about.
  *
@@ -19,7 +19,28 @@ import { proxyUrl } from "../proxyUrl";
  *  three accounts, and the place to see that is here — the "used by" column is
  *  the one number that matters, since several accounts behind one address is
  *  the oldest farm signal there is. */
-export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile[]; local: boolean; myEmail?: string | null }) {
+export function Proxies({
+  profiles,
+  local,
+  myEmail = null,
+  canCheck,
+  onCheckProxy,
+  proxyCheckFor,
+  onProxySaved,
+}: {
+  profiles: Profile[];
+  local: boolean;
+  myEmail?: string | null;
+  /** Team proxy checks require the same organisation-wide secret permission
+   *  as the sealed credential endpoint. */
+  canCheck: boolean;
+  /** The parent owns checks so a profile row and this table cannot run two
+   *  requests for the same saved proxy. `true` means the stored exit changed. */
+  onCheckProxy: (proxy: LocalProxy) => Promise<boolean>;
+  proxyCheckFor: (proxy: LocalProxy) => ProxyCheckState | undefined;
+  /** A proxy edit makes any cached row-check outcome stale. */
+  onProxySaved?: (id: string) => void;
+}) {
   const { t, say } = useI18n();
   const { ask, dialog } = useAsk();
   const [rows, setRows] = useState<LocalProxy[]>([]);
@@ -27,40 +48,9 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
   const [pasting, setPasting] = useState(false);
   const [shopping, setShopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Checking every proxy at once (5.7): per-row outcome, and how far along.
-  const [checks, setChecks] = useState<Map<string, { ok: boolean; ms?: number; error?: string }>>(new Map());
+  // Check all is deliberately an operator action. Its progress is separate
+  // from the shared per-proxy state, so one pending row never freezes another.
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
-
-  /** The URL the single-proxy form would build. In team mode the password is
-   *  not here, and check_proxy fetches it by id instead. */
-  const urlOf = (p: LocalProxy) => proxyUrl(p.kind, p.host, p.port, p.username, p.password);
-
-  const checkAll = async () => {
-    const list = rows;
-    setChecks(new Map());
-    setChecking({ done: 0, total: list.length });
-    let done = 0;
-    // Three at a time: the checker is a third party, and forty simultaneous
-    // requests from one address is how a checker starts refusing.
-    const queue = [...list];
-    const worker = async () => {
-      for (;;) {
-        const p = queue.shift();
-        if (!p) return;
-        try {
-          const r = await api.checkProxy(urlOf(p), p.checker_url, p.id);
-          setChecks((m) => new Map(m).set(p.id, { ok: r.ok, ms: r.ms, error: r.ok ? undefined : r.error }));
-        } catch (e) {
-          setChecks((m) => new Map(m).set(p.id, { ok: false, error: say(e) }));
-        }
-        done++;
-        setChecking({ done, total: list.length });
-      }
-    };
-    await Promise.all([worker(), worker(), worker()]);
-    setChecking(null);
-    await load();
-  };
 
   /** Local proxies whose password the keychain will not open now. They read
    *  back blank, and nothing used to say so: a tester re-typed every one after
@@ -84,7 +74,51 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
     void load();
   }, [load]);
 
+  const runCheck = async (proxy: LocalProxy) => {
+    try {
+      return await onCheckProxy(proxy);
+    } catch (e) {
+      setError(say(e));
+      return false;
+    }
+  };
+
+  const checkOne = async (proxy: LocalProxy) => {
+    const changed = await runCheck(proxy);
+    if (changed) await load();
+  };
+
+  const checkAll = async () => {
+    if (!canCheck) return;
+    // Do not enqueue a second request for an exit already being checked from a
+    // profile row. The parent also deduplicates, this avoids misleading batch
+    // progress for a request this button did not start.
+    const list = rows.filter((proxy) => proxyCheckFor(proxy)?.state !== "checking");
+    if (list.length === 0) return;
+    setChecking({ done: 0, total: list.length });
+    let done = 0;
+    let changed = false;
+    // Three at a time: the checker is a third party, and forty simultaneous
+    // requests from one address is how a checker starts refusing.
+    const queue = [...list];
+    const worker = async () => {
+      for (;;) {
+        const proxy = queue.shift();
+        if (!proxy) return;
+        changed = (await runCheck(proxy)) || changed;
+        done++;
+        setChecking({ done, total: list.length });
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    setChecking(null);
+    if (changed) await load();
+  };
+
   const usedBy = (id: string) => profiles.filter((p) => p.proxy?.id === id).length;
+  const checkResults = rows
+    .map(proxyCheckFor)
+    .filter((check): check is ProxyCheckState => check?.state === "ok" || check?.state === "error");
 
   return (
     <>
@@ -94,14 +128,14 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
           {t("px.newOne")}
         </button>
         <button onClick={() => setPasting(true)}>{t("pp.paste")}</button>
-        {rows.length > 0 && (
+        {canCheck && rows.length > 0 && (
           <button className="ghost" disabled={checking !== null} onClick={() => void checkAll()}>
             {checking ? t("px.checkingN", { done: checking.done, total: checking.total }) : t("px.checkAll", { n: rows.length })}
           </button>
         )}
-        {!checking && checks.size > 0 && (
+        {!checking && checkResults.length > 0 && (
           <span className="muted small">
-            {t("px.checkSummary", { ok: [...checks.values()].filter((c) => c.ok).length, bad: [...checks.values()].filter((c) => !c.ok).length })}
+            {t("px.checkSummary", { ok: checkResults.filter((check) => check.state === "ok").length, bad: checkResults.filter((check) => check.state === "error").length })}
           </span>
         )}
         <div className="spacer" />
@@ -173,12 +207,12 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
                       </>
                     )}
                     {(() => {
-                      const c = checks.get(p.id);
-                      if (!c) return null;
-                      return c.ok ? (
-                        <div className="ok">{t("px.checkOk", { ms: c.ms ?? 0 })}</div>
+                      const check = proxyCheckFor(p);
+                      if (!check || check.state === "checking") return null;
+                      return check.state === "ok" ? (
+                        <div className="ok">{t("px.checkOk", { ms: check.ms ?? 0 })}</div>
                       ) : (
-                        <div className="warn" title={c.error}>{t("px.checkBad")}</div>
+                        <div className="warn" title={check.error}>{t("px.checkBad")}</div>
                       );
                     })()}
                   </td>
@@ -187,8 +221,28 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
                   </td>
                   <td className="actions">
                     <div>
-                      {/* The same two icons a profile row has, in the same
-                          places: one table's pencil is every table's pencil. */}
+                      {/* Check is first because it describes the exit; editing
+                          and deletion remain the table's ordinary actions. */}
+                      {canCheck && (() => {
+                        const check = proxyCheckFor(p);
+                        const label = check?.state === "checking" ? t("px.checking") : t("px.check");
+                        const title = check?.state === "ok"
+                          ? t("px.checkOk", { ms: check.ms ?? 0 })
+                          : check?.state === "error"
+                            ? check.error ?? t("px.checkBad")
+                            : label;
+                        return (
+                          <span className={`proxyTableCheck proxyCheck-${check?.state ?? "idle"}`}>
+                            <IconButton
+                              icon="check"
+                              label={label}
+                              title={title}
+                              disabled={check?.state === "checking"}
+                              onClick={() => void checkOne(p)}
+                            />
+                          </span>
+                        );
+                      })()}
                       <IconButton icon="pencil" label={t("row.edit")} onClick={() => setEditing(p)} />
                       <IconButton
                         icon="trash"
@@ -226,7 +280,8 @@ export function Proxies({ profiles, local, myEmail = null }: { profiles: Profile
           editing={editing}
           myEmail={myEmail}
           onClose={() => setEditing(undefined)}
-          onSaved={async () => {
+          onSaved={async (id) => {
+            onProxySaved?.(id);
             setEditing(undefined);
             await load();
           }}

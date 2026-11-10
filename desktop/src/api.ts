@@ -1125,7 +1125,7 @@ export const api = {
     cmd<{ id: string }>("save_proxy", { proxy, origin: origin ?? null }),
   deleteProxy: (id: string, origin?: Origin): Promise<unknown> =>
     cmd("delete_proxy", { id, origin: origin ?? null }),
-  checkProxy: (url: string, checkerUrl?: string | null, proxyId?: string | null): Promise<{
+  checkProxy: (url: string, checkerUrl?: string | null, proxyId?: string | null, origin?: Origin): Promise<{
     ok: boolean; error?: string; ip?: string; country?: string;
     city?: string; timezone?: string; org?: string; ms?: number;
     /** Why it failed, for the interface's own sentence (ipc.rs check_failure). */
@@ -1134,7 +1134,7 @@ export const api = {
      *  nothing. Present only on a failure, and only when the other family
      *  actually worked — see agent/src/diagnose.rs `speaks_instead`. */
     suggested_kind?: string | null;
-  }> => cmd("check_proxy", { url, checkerUrl: checkerUrl || null, proxyId: proxyId || null }),
+  }> => cmd("check_proxy", { url, checkerUrl: checkerUrl || null, proxyId: proxyId || null, origin: origin ?? null }),
   /** The check step by step; the first failing step carries a `code` the
    *  interface translates. See agent/src/diagnose.rs. */
   diagnoseProxy: (url: string, checkerUrl?: string | null, proxyId?: string | null): Promise<Diagnosis> =>

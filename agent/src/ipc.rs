@@ -1435,7 +1435,22 @@ impl Agent {
             // want to tell ipinfo.io that this proxy exists can point
             // FURY_IP_CHECK at their own.
             "proxies.check" => {
-                let url = str_param(&params, "url")?;
+                // A profile row has a proxy id but never its password. Let a
+                // stored check resolve that secret in the agent. A non-empty
+                // URL is deliberately left alone: the edit form uses one to
+                // try unsaved fields, and that observation must not overwrite
+                // the saved proxy's exit metadata.
+                let stored = match params.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => self.store.proxy_for_check(id).await?,
+                    None => None,
+                };
+                let url = match params.get("url").and_then(|v| v.as_str()).filter(|u| !u.trim().is_empty()) {
+                    Some(url) => url.to_string(),
+                    None => stored
+                        .as_ref()
+                        .map(|(proxy, _)| proxy.url())
+                        .ok_or_else(|| anyhow::anyhow!("missing parameter \"url\" (or an \"id\" of a stored proxy)"))?,
+                };
                 let upstream = crate::parse_upstream(&url)?;
                 // Parsed first so a malformed proxy string fails here rather
                 // than as an opaque transport error thirty seconds later.
@@ -1446,6 +1461,7 @@ impl Agent {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .map(str::to_string)
+                    .or_else(|| stored.as_ref().and_then(|(proxy, _)| proxy.checker_url.clone()))
                     .or_else(|| std::env::var("FURY_IP_CHECK").ok())
                     .unwrap_or_else(|| "https://ipinfo.io/json".to_string());
                 // A local MMDB path in the checker field (issue #4): the
@@ -1536,17 +1552,31 @@ impl Agent {
                         s("loc").map(str::to_string),
                     ),
                 };
-                if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
-                    let _ = self
-                        .store
-                        .record_exit(
-                            id,
-                            s("ip"),
-                            country.as_deref(),
-                            timezone.as_deref(),
-                            location.as_deref(),
-                        )
-                        .await;
+                let ip = s("ip")
+                    .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+                    .ok_or_else(|| anyhow::anyhow!("the proxy checker did not return a valid IP address"))?;
+                // `id` only means "store this exit" with the stored URL. A
+                // non-empty URL may contain edits that are not saved yet.
+                if params.get("url").and_then(|v| v.as_str()).is_none_or(|url| url.trim().is_empty()) {
+                    if let (Some(id), Some((_, snapshot))) = (
+                        params.get("id").and_then(|v| v.as_str()),
+                        stored.as_ref(),
+                    ) {
+                        let persisted = self
+                            .store
+                            .record_exit_if_current(
+                                id,
+                                snapshot,
+                                ip,
+                                country.as_deref(),
+                                timezone.as_deref(),
+                                location.as_deref(),
+                            )
+                            .await?;
+                        if !persisted {
+                            anyhow::bail!("the proxy changed while it was being checked; run the check again");
+                        }
+                    }
                 }
 
                 Ok(json!({

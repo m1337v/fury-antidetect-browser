@@ -2722,6 +2722,62 @@ async fn resolve_proxy_url(
     Ok(url)
 }
 
+/// A stored team proxy is decrypted in this process, then checked by the local
+/// agent. The server returns an opaque configuration version alongside the
+/// already-authorised ciphertext; a successful observation is accepted only
+/// while that exact upstream is still stored there.
+struct TeamProxyCheck {
+    id: String,
+    check_version: String,
+}
+
+async fn resolve_proxy_check(
+    state: &State<'_, AppState>,
+    url: String,
+    proxy_id: Option<String>,
+    origin: Option<&str>,
+) -> R<(String, Option<String>, Option<TeamProxyCheck>)> {
+    let stored_check = url.trim().is_empty();
+    if local_for(state, origin) {
+        // Passing an id only for a stored check matters: the agent resolves a
+        // blank URL from its local encrypted store and writes the result only
+        // when that configuration is still current. A form's typed URL may be
+        // unsaved and must neither be replaced nor persisted.
+        return Ok((url, stored_check.then_some(proxy_id).flatten(), None));
+    }
+
+    // Preserve the existing team form behaviour: a team proxy id has always
+    // caused this process to use sealed, saved credentials rather than expose
+    // a password to the webview. Only a deliberately blank URL is a stored
+    // row check and gains result persistence.
+    let Some(id) = proxy_id else {
+        return Ok((url, None, None));
+    };
+    let org_key = state.org_key().ok_or_else(|| {
+        ApiErr::coded(
+            "err.noOrgKeySeal",
+            "This machine does not hold the organisation key, so it cannot open this \
+             proxy's credentials to check it.",
+        )
+    })?;
+    let (sealed, creds) = stored_proxy_credentials(state, &org_key, &id).await?;
+    let field = |key: &str| sealed.get(key).and_then(|value| value.as_str()).unwrap_or_default();
+    let port = sealed.get("port").and_then(|value| value.as_i64()).unwrap_or(0);
+    let resolved = proxy_url(field("kind"), field("host"), port, creds.username, creds.password);
+    let stored = if stored_check {
+        let check_version = field("check_version").to_string();
+        if check_version.is_empty() {
+            return Err(ApiErr::local(
+                "The team server did not return a proxy check version. Update the team server before checking saved proxies.",
+            ));
+        }
+        Some(TeamProxyCheck { id, check_version })
+    } else {
+        None
+    };
+    Ok((resolved, None, stored))
+}
+
 #[tauri::command]
 pub async fn check_proxy(
     state: State<'_, AppState>,
@@ -2731,18 +2787,47 @@ pub async fn check_proxy(
     // interface has no password to build a URL from, so the credentials are
     // fetched and opened here instead.
     proxy_id: Option<String>,
+    // A connected shell can show local and team rows together. When absent,
+    // retain the older mode-based behaviour for form callers.
+    origin: Option<String>,
 ) -> R<serde_json::Value> {
-    let stored_id = proxy_id.clone();
-    let url = resolve_proxy_url(&state, url, proxy_id).await?;
+    let (url, stored_id, team_proxy) =
+        resolve_proxy_check(&state, url, proxy_id, origin.as_deref()).await?;
     // The check itself always runs on this machine, in both modes: it is the
     // machine whose exit the answer describes.
-    Ok(crate::agent::call(
+    let result: serde_json::Value = crate::agent::call(
         "proxies.check",
         // The id, when there is one, so the agent can remember what it learned
         // and a launch that follows this exit does not ask again.
         serde_json::json!({ "url": url, "checker_url": checker_url, "id": stored_id }),
     )
-    .await?)
+    .await?;
+
+    if let Some(proxy) = team_proxy {
+        if result.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+            let ip = result
+                .get("ip")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| ApiErr::local("The proxy checker did not return an IP address."))?;
+            let country = result.get("country").and_then(|value| value.as_str());
+            let timezone = result.get("timezone").and_then(|value| value.as_str());
+            let _: serde_json::Value = state
+                .call(
+                    reqwest::Method::POST,
+                    &format!("/v1/proxies/{}/check", proxy.id),
+                    Body::Json(serde_json::json!({
+                        "check_version": proxy.check_version,
+                        "ip": ip,
+                        "country": country,
+                        "timezone": timezone,
+                    })),
+                    true,
+                )
+                .await?;
+        }
+    }
+
+    Ok(result)
 }
 
 /// The check step by step, with the first failure named — see

@@ -177,7 +177,9 @@ export function ProfileDialog({
    *  so the person picks it instead of the shell deciding silently. */
   canChoose: boolean;
   onClose: () => void;
-  onSaved: () => void;
+  /** Returned after a saved proxy was selected or configured, so list-level
+   *  check badges do not describe fields that were just edited. */
+  onSaved: (saved?: { origin: "local" | "team"; proxyId?: string }) => void;
 }) {
   const { t, say } = useI18n();
   // The interface language, for naming languages in it.
@@ -395,7 +397,10 @@ export function ProfileDialog({
       // with both worlds in one list, the shell's mode no longer says which.
       // A new one goes where the dialog says, never to the shell's default.
       editing?.origin ?? where);
-      onSaved();
+      // A borrowed profile is never edited through this dialog, but `Profile`
+      // includes that origin. The proxy save path above treats it as local
+      // too, so keep the callback's store key equally explicit.
+      onSaved({ origin: target === "team" ? "team" : "local", proxyId: useProxyId || undefined });
     } catch (e) {
       setError(say(e));
     } finally {

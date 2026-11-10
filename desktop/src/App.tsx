@@ -34,6 +34,7 @@ import { exitSharing } from "./consistency";
 import { isSuggested, setStage as saveStage } from "./status";
 import { Select } from "./components/Select";
 import { OUR_SERVERS, versionNewer } from "./defaults";
+import { proxyCheckKey, type ProxyCheckState } from "./proxyCheck";
 
 /** What the browser build the agent asks for changes, for the bar that offers
  *  it. One sentence for every build told a Mac being offered 0.3.8 about a
@@ -72,6 +73,11 @@ export function App() {
   // agent already keeps; refreshed with the rows.
   const [personaIds, setPersonaIds] = useState<Set<string> | null>(null);
   const [proxyList, setProxyList] = useState<LocalProxy[] | null>(null);
+  /** Check outcomes survive navigating between Profiles and Proxies. An id by
+   *  itself is not enough: local and team stores are separate namespaces. */
+  const [proxyChecks, setProxyChecks] = useState<Map<string, ProxyCheckState>>(new Map());
+  const checkingProxies = useRef(new Set<string>());
+  const refreshingProxyMetadata = useRef<Promise<void> | null>(null);
   const [shared, setShared] = useState<Profile[]>([]);
   /** The profiles a share dialog is open for, or null. */
   const [sharing, setSharing] = useState<Profile[] | null>(null);
@@ -420,6 +426,65 @@ export function App() {
       else setError(say(e));
     }
   }, [active, ready, me?.user_id]);
+
+  /** Refresh list metadata once for a burst of checks. Checking three saved
+   *  exits in parallel must not make three full profile-list requests. */
+  const refreshCheckedProxy = useCallback(async (origin: "local" | "team") => {
+    if (!refreshingProxyMetadata.current) {
+      refreshingProxyMetadata.current = refreshProfiles().finally(() => {
+        refreshingProxyMetadata.current = null;
+      });
+    }
+    await refreshingProxyMetadata.current;
+    // `proxyList` is the shell's active store. A profile from the other store
+    // still got fresh exit metadata from refreshProfiles above.
+    if ((origin === "local") === local) {
+      setProxyList(await api.proxies(origin));
+    }
+  }, [local, refreshProfiles]);
+
+  /** One check for one saved proxy. The native layer resolves the stored
+   *  credentials, so no password is ever reassembled in the webview. */
+  const runProxyCheck = useCallback(async (origin: "local" | "team", proxyId: string): Promise<boolean> => {
+    const key = proxyCheckKey(origin, proxyId);
+    if (checkingProxies.current.has(key)) return false;
+    checkingProxies.current.add(key);
+    setProxyChecks((checks) => new Map(checks).set(key, { state: "checking" }));
+    try {
+      const result = await api.checkProxy("", null, proxyId, origin);
+      if (!result.ok) {
+        setProxyChecks((checks) => new Map(checks).set(key, {
+          state: "error",
+          error: say({ code: result.error_code ? `pxc.${result.error_code}` : null, message: result.error ?? t("px.checkBad") }),
+        }));
+        return false;
+      }
+      // Keep the row disabled through the metadata refresh: otherwise the
+      // button looks ready while the in-flight guard still drops a second
+      // press. A failed refresh does not turn a successful check into a fail.
+      await refreshCheckedProxy(origin).catch(() => {});
+      setProxyChecks((checks) => new Map(checks).set(key, { state: "ok", ms: result.ms }));
+      return true;
+    } catch (e) {
+      setProxyChecks((checks) => new Map(checks).set(key, { state: "error", error: say(e) }));
+      return false;
+    } finally {
+      checkingProxies.current.delete(key);
+    }
+  }, [refreshCheckedProxy, say, t]);
+
+  /** A save can change the endpoint, credentials, or checker. Keep an active
+   *  request visible until it settles, but discard completed observations that
+   *  no longer necessarily describe the stored proxy. */
+  const clearCompletedProxyCheck = useCallback((origin: "local" | "team", proxyId: string) => {
+    const key = proxyCheckKey(origin, proxyId);
+    setProxyChecks((checks) => {
+      if (!checks.has(key) || checks.get(key)?.state === "checking") return checks;
+      const next = new Map(checks);
+      next.delete(key);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     void refreshProfiles();
@@ -1640,7 +1705,17 @@ export function App() {
         {/* No project selected is not the same as a project with no profiles,
             and saying the latter to someone who has been granted nothing sends
             them looking for a profile list that was never theirs. */}
-        {view === "proxies" && <Proxies profiles={profiles} local={local} myEmail={me?.email ?? null} />}
+        {view === "proxies" && (
+          <Proxies
+            profiles={profiles}
+            local={local}
+            myEmail={me?.email ?? null}
+            canCheck={local || me?.role === "owner" || me?.role === "admin"}
+            onCheckProxy={(proxy) => runProxyCheck(local ? "local" : "team", proxy.id)}
+            proxyCheckFor={(proxy) => proxyChecks.get(proxyCheckKey(local ? "local" : "team", proxy.id))}
+            onProxySaved={(id) => clearCompletedProxyCheck(local ? "local" : "team", id)}
+          />
+        )}
         {view === "extensions" && <ExtensionsView profiles={profiles} />}
         {view === "bookmarks" && <BookmarksView profiles={profiles} />}
         {view === "assistants" && <AssistantsView />}
@@ -1715,6 +1790,12 @@ export function App() {
                 setEditingTab("Proxy");
                 setEditing(p);
               }}
+              onCheckProxy={(p) => {
+                if (p.proxy && p.origin !== "shared") void runProxyCheck(p.origin, p.proxy.id);
+              }}
+              proxyCheckFor={(p) => p.proxy && p.origin !== "shared"
+                ? proxyChecks.get(proxyCheckKey(p.origin, p.proxy.id))
+                : undefined}
               onExtensions={setExtFor}
               onShare={local ? undefined : (p) => setSharing([p])}
               onNetwork={setNetFor}
@@ -1810,7 +1891,8 @@ export function App() {
               setEditing(undefined);
               setEditingTab("General");
             }}
-            onSaved={async () => {
+            onSaved={async (saved) => {
+              if (saved?.proxyId) clearCompletedProxyCheck(saved.origin, saved.proxyId);
               setEditing(undefined);
               setEditingTab("General");
               await load();

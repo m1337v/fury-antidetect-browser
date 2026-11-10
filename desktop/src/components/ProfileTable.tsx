@@ -9,6 +9,7 @@ import type { Me, Profile } from "../api";
 import { platformOf } from "../platform";
 import { assess } from "../consistency";
 import { isSuggested, statusHue } from "../status";
+import type { ProxyCheckState } from "../proxyCheck";
 
 /** Every row's controls follow the permissions the SERVER resolved. Hiding a
  *  button is presentation, not protection — the server refuses regardless — but
@@ -63,6 +64,8 @@ export function ProfileTable({
   onStop,
   onEdit,
   onEditProxy,
+  onCheckProxy,
+  proxyCheckFor,
   onDelete,
   onExtensions,
   onShare,
@@ -91,6 +94,10 @@ export function ProfileTable({
    *  needs both profile and proxy-edit permission, so this stays absent for a
    *  member who may inspect the profile but not reroute it. */
   onEditProxy?: (p: Profile) => void;
+  /** Checks this profile's saved proxy. The caller owns the request because
+   *  local and team proxies may have the same id. */
+  onCheckProxy?: (p: Profile) => void;
+  proxyCheckFor?: (p: Profile) => ProxyCheckState | undefined;
   onDelete?: (p: Profile) => void;
   /** Extensions and disk usage — the two things beside the browser data. */
   onExtensions?: (p: Profile) => void;
@@ -216,6 +223,13 @@ export function ProfileTable({
           const canEdit = p.permissions.includes("edit_profile");
           const canEditProxy = canEdit && p.permissions.includes("edit_proxy");
           const canReveal = p.permissions.includes("reveal_secrets");
+          // Team proxy credentials are an organisation-wide resource: its
+          // stored-check endpoint follows the same owner/admin rule as the
+          // Proxies page, even where this particular profile grant reveals
+          // its details. Local profiles stay with their resolved permission.
+          const canCheckProxy = p.origin === "local"
+            ? canReveal
+            : me?.role === "owner" || me?.role === "admin";
           const locked = p.lock !== null;
           const open = isOpenHere(p, { local, userId: me?.user_id, machine: thisMachine });
           const starting = launching?.has(p.id) ?? false;
@@ -235,6 +249,13 @@ export function ProfileTable({
             p.proxy && !canReveal ? t("row.masked") : "",
             p.proxy && shared >= 2 ? t("row.sharedExit", { n: shared }) : "",
           ].filter(Boolean).join(" · ");
+          const proxyCheck = p.proxy ? proxyCheckFor?.(p) : undefined;
+          const checkLabel = proxyCheck?.state === "checking" ? t("px.checking") : t("px.check");
+          const checkTitle = proxyCheck?.state === "ok"
+            ? t("px.checkOk", { ms: proxyCheck.ms ?? 0 })
+            : proxyCheck?.state === "error"
+              ? proxyCheck.error ?? t("px.checkBad")
+              : checkLabel;
 
           return (
             <tr key={p.id} data-row className={selected.has(p.id) ? "picked" : undefined}>
@@ -314,6 +335,20 @@ export function ProfileTable({
                 {p.proxy ? (
                   <div className="proxyCell">
                     <div className="proxyLabelRow">
+                      {onCheckProxy && canCheckProxy && (
+                        <span
+                          className={`proxyCheck proxyCheck-${proxyCheck?.state ?? "idle"}`}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <IconButton
+                            icon="check"
+                            label={checkLabel}
+                            title={checkTitle}
+                            disabled={proxyCheck?.state === "checking"}
+                            onClick={() => onCheckProxy(p)}
+                          />
+                        </span>
+                      )}
                       <div className="proxyLabel" title={p.proxy.name}>
                         {p.proxy.name || p.proxy.display}
                       </div>

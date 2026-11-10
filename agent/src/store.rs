@@ -107,6 +107,18 @@ pub struct Proxy {
     pub checker_url: Option<String>,
 }
 
+/// Raw saved upstream fields captured just before a manual check. This never
+/// crosses IPC or reaches a log: it exists solely to make the exit update a
+/// no-op if somebody changes the proxy while that check is in flight.
+#[derive(Clone)]
+pub struct ProxyCheckSnapshot {
+    kind: String,
+    host: String,
+    port: i64,
+    username: Option<String>,
+    password: Option<String>,
+}
+
 impl Proxy {
     /// The upstream URL the relay takes.
     pub fn url(&self) -> String {
@@ -582,6 +594,31 @@ impl Store {
         Ok(rows.iter().map(|r| self.open_proxy(row_to_proxy(r))).collect())
     }
 
+    /// Open one saved proxy for a row check and retain the encrypted fields
+    /// that identify exactly what was checked. The snapshot deliberately
+    /// excludes the label: a rename may happen while a check runs without
+    /// making the observed exit stale.
+    pub async fn proxy_for_check(&self, id: &str) -> anyhow::Result<Option<(Proxy, ProxyCheckSnapshot)>> {
+        let row = sqlx::query(
+            "SELECT id, name, kind, host, port, username, password, last_country, last_ip, \
+                    last_timezone, rotate_url, checker_url \
+             FROM proxies WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| {
+            let snapshot = ProxyCheckSnapshot {
+                kind: row.get("kind"),
+                host: row.get("host"),
+                port: row.get("port"),
+                username: row.get("username"),
+                password: row.get("password"),
+            };
+            (self.open_proxy(row_to_proxy(&row)), snapshot)
+        }))
+    }
+
     pub async fn upsert_proxy(&self, p: &Proxy) -> anyhow::Result<String> {
         let id = if p.id.is_empty() { new_id() } else { p.id.clone() };
         // A secret this machine cannot open right now was shown to the form as
@@ -589,17 +626,43 @@ impl Store {
         // keychain refused once" into "the password is gone": a tester re-typed
         // every proxy password after an update (15.10.2026). Kept as stored
         // unless something new was typed in its place.
-        let stored: Option<(Option<String>, Option<String>)> = if p.id.is_empty() {
+        // Compare and update in one SQLite transaction. A check is conditional
+        // on these same saved fields, so a concurrent configuration edit either
+        // serialises here or SQLite refuses the stale writer rather than
+        // preserving an observation for the wrong upstream.
+        let mut tx = self.pool.begin().await?;
+        let stored: Option<(String, String, i64, Option<String>, Option<String>, Option<String>)> = if p.id.is_empty() {
             None
         } else {
-            sqlx::query_as("SELECT password, rotate_url FROM proxies WHERE id = ?")
+            sqlx::query_as(
+                "SELECT kind, host, port, username, password, rotate_url FROM proxies WHERE id = ?",
+            )
                 .bind(&id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?
         };
-        let (old_password, old_rotate) = stored.unwrap_or((None, None));
+        let (old_kind, old_host, old_port, old_username, old_password, old_rotate) =
+            stored.unwrap_or_else(|| (String::new(), String::new(), 0, None, None, None));
+        let password_changed = match (p.password.as_deref().filter(|v| !v.is_empty()), old_password.as_deref()) {
+            (Some(incoming), Some(old)) => self.vault.open_value(old) != incoming,
+            (Some(_), None) => true,
+            // A blank from an unreadable vault preserves the old secret; a
+            // readable one means the operator explicitly cleared it.
+            (None, Some(old)) => self.vault.opens(old),
+            (None, None) => false,
+        };
         let secret = |incoming: Option<&str>, old: Option<String>| -> Option<String> {
             match (incoming.filter(|v| !v.is_empty()), old) {
+                // Preserve an unchanged sealed value byte-for-byte. Apart from
+                // avoiding needless encryption churn, a manual check holds
+                // this stored snapshot while the label may be edited.
+                (Some(incoming), Some(old))
+                    if old.starts_with("fury:v1:")
+                        && self.vault.opens(&old)
+                        && self.vault.open_value(&old) == incoming =>
+                {
+                    Some(old)
+                }
                 (None, Some(old)) if !self.vault.opens(&old) => {
                     tracing::warn!(proxy = %p.name, "kept a stored secret this machine cannot open; nothing new was typed");
                     Some(old)
@@ -613,6 +676,12 @@ impl Store {
         };
         let password = secret(p.password.as_deref(), old_password);
         let rotate_url = secret(p.rotate_url.as_deref(), old_rotate);
+        let configuration_changed = !p.id.is_empty()
+            && (old_kind != p.kind
+                || old_host != p.host
+                || old_port != i64::from(p.port)
+                || old_username != p.username
+                || password_changed);
         sqlx::query(
             "INSERT INTO proxies
                 (id, name, kind, host, port, username, password, rotate_url, checker_url, created_at)
@@ -621,7 +690,12 @@ impl Store {
                 name = excluded.name, kind = excluded.kind, host = excluded.host,
                 port = excluded.port, username = excluded.username,
                 password = excluded.password, rotate_url = excluded.rotate_url,
-                checker_url = excluded.checker_url, deleted_at = NULL",
+                checker_url = excluded.checker_url, deleted_at = NULL,
+                last_ip = CASE WHEN ? THEN NULL ELSE last_ip END,
+                last_country = CASE WHEN ? THEN NULL ELSE last_country END,
+                last_timezone = CASE WHEN ? THEN NULL ELSE last_timezone END,
+                last_location = CASE WHEN ? THEN NULL ELSE last_location END,
+                checked_at = CASE WHEN ? THEN NULL ELSE checked_at END",
         )
         .bind(&id)
         .bind(&p.name)
@@ -633,8 +707,14 @@ impl Store {
         .bind(rotate_url)
         .bind(&p.checker_url)
         .bind(now())
-        .execute(&self.pool)
+        .bind(configuration_changed)
+        .bind(configuration_changed)
+        .bind(configuration_changed)
+        .bind(configuration_changed)
+        .bind(configuration_changed)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -745,6 +825,41 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Store a manually checked exit only while the upstream saved at the
+    /// start of the check is still the one in the database. A concurrent
+    /// label edit matches and keeps the observation; endpoint or credential
+    /// edits do not.
+    pub async fn record_exit_if_current(
+        &self,
+        proxy_id: &str,
+        snapshot: &ProxyCheckSnapshot,
+        ip: &str,
+        country: Option<&str>,
+        timezone: Option<&str>,
+        location: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE proxies SET last_ip = ?, last_country = ?, last_timezone = ?, \
+                    last_location = ?, checked_at = ? \
+             WHERE id = ? AND deleted_at IS NULL AND kind = ? AND host = ? AND port = ? \
+                   AND username IS ? AND password IS ?",
+        )
+        .bind(ip)
+        .bind(country)
+        .bind(timezone)
+        .bind(location)
+        .bind(now())
+        .bind(proxy_id)
+        .bind(&snapshot.kind)
+        .bind(&snapshot.host)
+        .bind(snapshot.port)
+        .bind(&snapshot.username)
+        .bind(&snapshot.password)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// The machine key, shared rather than rebuilt: a second vault would seal
