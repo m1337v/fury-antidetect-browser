@@ -34,7 +34,7 @@ import { exitSharing } from "./consistency";
 import { isSuggested, setStage as saveStage } from "./status";
 import { Select } from "./components/Select";
 import { OUR_SERVERS, versionNewer } from "./defaults";
-import { proxyCheckKey, type ProxyCheckState, type ProxyRotationState } from "./proxyCheck";
+import { proxyCheckKey, type ProxyOperation } from "./proxyCheck";
 
 /** What the browser build the agent asks for changes, for the bar that offers
  *  it. One sentence for every build told a Mac being offered 0.3.8 about a
@@ -73,14 +73,10 @@ export function App() {
   // agent already keeps; refreshed with the rows.
   const [personaIds, setPersonaIds] = useState<Set<string> | null>(null);
   const [proxyList, setProxyList] = useState<LocalProxy[] | null>(null);
-  /** Check outcomes survive navigating between Profiles and Proxies. An id by
-   *  itself is not enough: local and team stores are separate namespaces. */
-  const [proxyChecks, setProxyChecks] = useState<Map<string, ProxyCheckState>>(new Map());
-  const [proxyRotations, setProxyRotations] = useState<Map<string, ProxyRotationState>>(new Map());
-  /** A check and a rotation both act on the provider state behind one saved
-   *  proxy, so they share this guard. Other rows remain independent. */
+  /** Check and rotate outcomes survive navigating between Profiles and Proxies.
+   * An id alone is not enough: local and team stores are separate namespaces. */
+  const [proxyOperations, setProxyOperations] = useState<Map<string, ProxyOperation>>(new Map());
   const activeProxyOperations = useRef(new Set<string>());
-  const refreshingProxyMetadata = useRef<Promise<void> | null>(null);
   const [shared, setShared] = useState<Profile[]>([]);
   /** The profiles a share dialog is open for, or null. */
   const [sharing, setSharing] = useState<Profile[] | null>(null);
@@ -430,142 +426,62 @@ export function App() {
     }
   }, [active, ready, me?.user_id]);
 
-  /** Refresh list metadata once for a burst of proxy operations. Checking or
-   *  rotating three saved exits in parallel must not make three full
-   *  profile-list requests. */
-  const refreshCheckedProxy = useCallback(async (origin: "local" | "team") => {
-    if (!refreshingProxyMetadata.current) {
-      refreshingProxyMetadata.current = refreshProfiles().finally(() => {
-        refreshingProxyMetadata.current = null;
-      });
-    }
-    await refreshingProxyMetadata.current;
-    // `proxyList` is the shell's active store. A profile from the other store
-    // still got fresh exit metadata from refreshProfiles above.
-    if ((origin === "local") === local) {
-      setProxyList(await api.proxies(origin));
-    }
-  }, [local, refreshProfiles]);
-
-  /** A successful rotation invalidates the last observed exit before the
-   *  subsequent refresh. This avoids briefly displaying an old IP if that
-   *  refresh is unavailable; a manual check is the only proof of the new one. */
-  const clearCheckedProxyMetadata = useCallback((origin: "local" | "team", proxyId: string) => {
-    setProfiles((rows) => rows.map((profile) => (
-      profile.origin === origin && profile.proxy?.id === proxyId
-        ? {
-            ...profile,
-            proxy: {
-              ...profile.proxy,
-              country: null,
-              last_ip: null,
-              last_timezone: null,
-            },
-          }
-        : profile
-    )));
-    setProxyList((rows) => {
-      if ((origin === "local") !== local) return rows;
-      return rows?.map((proxy) => (
-        proxy.id === proxyId
-          ? { ...proxy, last_country: null, last_ip: null, last_timezone: null }
-          : proxy
-      )) ?? null;
-    });
-  }, [local]);
-
-  /** Completed observations are disposable: changing the endpoint or asking
-   *  its provider to rotate makes the old outcome no longer descriptive. */
-  const clearCompletedProxyCheck = useCallback((origin: "local" | "team", proxyId: string) => {
+  const clearProxyOperation = useCallback((origin: "local" | "team", proxyId: string) => {
     const key = proxyCheckKey(origin, proxyId);
-    setProxyChecks((checks) => {
-      if (!checks.has(key) || checks.get(key)?.state === "checking") return checks;
-      const next = new Map(checks);
+    setProxyOperations((operations) => {
+      if (!operations.has(key)) return operations;
+      const next = new Map(operations);
       next.delete(key);
       return next;
     });
   }, []);
 
-  const clearCompletedProxyRotation = useCallback((origin: "local" | "team", proxyId: string) => {
-    const key = proxyCheckKey(origin, proxyId);
-    setProxyRotations((rotations) => {
-      if (!rotations.has(key) || rotations.get(key)?.state === "rotating") return rotations;
-      const next = new Map(rotations);
-      next.delete(key);
-      return next;
-    });
-  }, []);
-
-  /** One check for one saved proxy. The native layer resolves the stored
-   *  credentials, so no password is ever reassembled in the webview. */
-  const runProxyCheck = useCallback(async (origin: "local" | "team", proxyId: string): Promise<boolean> => {
+  /** The native layer resolves saved credentials. A successful rotation clears
+   * the old observation; only a later explicit check supplies a new one. */
+  const runProxyOperation = useCallback(async (
+    action: "check" | "rotate",
+    origin: "local" | "team",
+    proxyId: string,
+  ): Promise<boolean> => {
     const key = proxyCheckKey(origin, proxyId);
     if (activeProxyOperations.current.has(key)) return false;
     activeProxyOperations.current.add(key);
-    clearCompletedProxyRotation(origin, proxyId);
-    setProxyChecks((checks) => new Map(checks).set(key, { state: "checking" }));
+    setProxyOperations((operations) => new Map(operations).set(key, {
+      action,
+      status: "pending",
+      exit: operations.get(key)?.exit,
+    }));
     try {
-      const result = await api.checkProxy("", null, proxyId, origin);
-      if (!result.ok) {
-        setProxyChecks((checks) => new Map(checks).set(key, {
-          state: "error",
-          error: say({ code: result.error_code ? `pxc.${result.error_code}` : null, message: result.error ?? t("px.checkBad") }),
-        }));
-        return false;
-      }
-      // Keep the row disabled through the metadata refresh: otherwise the
-      // button looks ready while the in-flight guard still drops a second
-      // press. A failed refresh does not turn a successful check into a fail.
-      await refreshCheckedProxy(origin).catch(() => {});
-      setProxyChecks((checks) => new Map(checks).set(key, { state: "ok", ms: result.ms }));
-      return true;
-    } catch (e) {
-      setProxyChecks((checks) => new Map(checks).set(key, { state: "error", error: say(e) }));
-      return false;
-    } finally {
-      activeProxyOperations.current.delete(key);
-    }
-  }, [clearCompletedProxyRotation, refreshCheckedProxy, say, t]);
-
-  /** A provider request is deliberately separate from checking. It records
-   *  that the provider accepted it, clears stale exits, and leaves proof of the
-   *  new exit to the operator's next explicit check. */
-  const runProxyRotation = useCallback(async (origin: "local" | "team", proxyId: string): Promise<boolean> => {
-    const key = proxyCheckKey(origin, proxyId);
-    if (activeProxyOperations.current.has(key)) return false;
-    activeProxyOperations.current.add(key);
-    setProxyRotations((rotations) => new Map(rotations).set(key, { state: "rotating" }));
-    try {
-      const result = await api.rotateProxy(proxyId, origin);
-      if (!result.ok) {
-        setProxyRotations((rotations) => new Map(rotations).set(key, {
-          state: "error",
-          error: result.error ?? t("px.checkBad"),
-        }));
-        return false;
-      }
-      // Stay visually pending until the coalesced refresh settles, while
-      // immediately dropping stale exit metadata on both table surfaces.
-      clearCheckedProxyMetadata(origin, proxyId);
-      clearCompletedProxyCheck(origin, proxyId);
-      setProxyRotations((rotations) => new Map(rotations).set(key, {
-        state: "rotating",
-        accepted: true,
+      const result: Awaited<ReturnType<typeof api.checkProxy>> = action === "check"
+        ? await api.checkProxy("", null, proxyId, origin)
+        : await api.rotateProxy(proxyId, origin);
+      const error = !result.ok
+        ? action === "check"
+          ? say({ code: result.error_code ? `pxc.${result.error_code}` : null, message: result.error ?? t("px.checkBad") })
+          : result.error ?? t("px.checkBad")
+        : undefined;
+      setProxyOperations((operations) => new Map(operations).set(key, {
+        action,
+        status: result.ok ? "ok" : "error",
+        exit: result.ok
+          ? action === "rotate" ? null : { ip: result.ip, country: result.country, timezone: result.timezone }
+          : operations.get(key)?.exit,
+        ms: action === "check" ? result.ms : undefined,
+        error,
       }));
-      await refreshCheckedProxy(origin).catch(() => {});
-      // A coalesced request might have started before the provider answered.
-      // Do not let that older snapshot put the prior exit back into either
-      // table; the next manual check is the source of a fresh observation.
-      clearCheckedProxyMetadata(origin, proxyId);
-      setProxyRotations((rotations) => new Map(rotations).set(key, { state: "ok" }));
-      return true;
+      return result.ok;
     } catch (e) {
-      setProxyRotations((rotations) => new Map(rotations).set(key, { state: "error", error: say(e) }));
+      setProxyOperations((operations) => new Map(operations).set(key, {
+        action,
+        status: "error",
+        exit: operations.get(key)?.exit,
+        error: say(e),
+      }));
       return false;
     } finally {
       activeProxyOperations.current.delete(key);
     }
-  }, [clearCheckedProxyMetadata, clearCompletedProxyCheck, refreshCheckedProxy, say, t]);
+  }, [say, t]);
 
   useEffect(() => {
     void refreshProfiles();
@@ -1792,15 +1708,11 @@ export function App() {
             local={local}
             myEmail={me?.email ?? null}
             canCheck={local || me?.role === "owner" || me?.role === "admin"}
-            canRotate={local || me?.role === "owner" || me?.role === "admin"}
-            onCheckProxy={(proxy) => runProxyCheck(local ? "local" : "team", proxy.id)}
-            proxyCheckFor={(proxy) => proxyChecks.get(proxyCheckKey(local ? "local" : "team", proxy.id))}
-            onRotateProxy={(proxy) => runProxyRotation(local ? "local" : "team", proxy.id)}
-            proxyRotationFor={(proxy) => proxyRotations.get(proxyCheckKey(local ? "local" : "team", proxy.id))}
-            onProxySaved={(id) => {
-              clearCompletedProxyCheck(local ? "local" : "team", id);
-              clearCompletedProxyRotation(local ? "local" : "team", id);
-            }}
+            canRotate={local}
+            onCheckProxy={(proxy) => runProxyOperation("check", local ? "local" : "team", proxy.id)}
+            onRotateProxy={(proxy) => runProxyOperation("rotate", local ? "local" : "team", proxy.id)}
+            proxyOperationFor={(proxy) => proxyOperations.get(proxyCheckKey(local ? "local" : "team", proxy.id))}
+            onProxySaved={(id) => clearProxyOperation(local ? "local" : "team", id)}
           />
         )}
         {view === "extensions" && <ExtensionsView profiles={profiles} />}
@@ -1878,16 +1790,13 @@ export function App() {
                 setEditing(p);
               }}
               onCheckProxy={(p) => {
-                if (p.proxy && p.origin !== "shared") void runProxyCheck(p.origin, p.proxy.id);
+                if (p.proxy && p.origin !== "shared") void runProxyOperation("check", p.origin, p.proxy.id);
               }}
-              proxyCheckFor={(p) => p.proxy && p.origin !== "shared"
-                ? proxyChecks.get(proxyCheckKey(p.origin, p.proxy.id))
-                : undefined}
               onRotateProxy={(p) => {
-                if (p.proxy && p.origin !== "shared") void runProxyRotation(p.origin, p.proxy.id);
+                if (p.proxy && p.origin !== "shared") void runProxyOperation("rotate", p.origin, p.proxy.id);
               }}
-              proxyRotationFor={(p) => p.proxy && p.origin !== "shared"
-                ? proxyRotations.get(proxyCheckKey(p.origin, p.proxy.id))
+              proxyOperationFor={(p) => p.proxy && p.origin !== "shared"
+                ? proxyOperations.get(proxyCheckKey(p.origin, p.proxy.id))
                 : undefined}
               onExtensions={setExtFor}
               onShare={local ? undefined : (p) => setSharing([p])}
@@ -1986,8 +1895,7 @@ export function App() {
             }}
             onSaved={async (saved) => {
               if (saved?.proxyId) {
-                clearCompletedProxyCheck(saved.origin, saved.proxyId);
-                clearCompletedProxyRotation(saved.origin, saved.proxyId);
+                clearProxyOperation(saved.origin, saved.proxyId);
               }
               setEditing(undefined);
               setEditingTab("General");

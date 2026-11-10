@@ -533,10 +533,6 @@ export interface LocalProxy {
   last_timezone?: string | null;
   /** Provider link that hands out a new exit IP. */
   rotate_url: string | null;
-  /** A private provider rotation link is saved, without returning that link. */
-  has_rotation?: boolean;
-  /** Remove the saved rotation link. A blank `rotate_url` otherwise preserves it. */
-  clear_rotation?: boolean;
   /** Where to ask what the exit looks like; null uses the default. */
   checker_url: string | null;
 }

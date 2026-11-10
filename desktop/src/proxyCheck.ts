@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright 2026 Bogdan Shapovalov and the Fury authors
 
-/** A check belongs to a saved proxy in one store. The same UUID can exist in
- *  the local database and on a team server, so the origin is part of its key. */
-export type ProxyCheckState = {
-  state: "checking" | "ok" | "error";
-  ms?: number;
-  error?: string;
+/** A manual observation wins over metadata read before a rotation. `null`
+ * means a rotation was accepted, so the old exit remains hidden until checked. */
+export type ProxyExit = {
+  ip?: string;
+  country?: string;
+  timezone?: string;
 };
 
-/** Rotation asks the provider to issue a new exit. It intentionally does not
- *  claim that the exit changed: only a later manual check can establish that. */
-export type ProxyRotationState = {
-  state: "rotating" | "ok" | "error";
-  /** The provider accepted the request, but row metadata is still refreshing. */
-  accepted?: boolean;
+/** A saved proxy is shared by profile and proxy rows, so its current action
+ * and observation live under one store-qualified key. */
+export type ProxyOperation = {
+  action: "check" | "rotate";
+  status: "pending" | "ok" | "error";
+  exit?: ProxyExit | null;
+  ms?: number;
   error?: string;
 };
 

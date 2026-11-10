@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use fury_shared::api::{ProfileSummary, ProjectSummary, ProxySummary};
+use fury_shared::api::{ProfileSummary, ProjectSummary};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -1177,6 +1177,7 @@ pub struct UiProxy {
     /// without `reveal_secrets`; never masked locally, where there is nobody to
     /// hide it from and the operator has to be able to check what they typed.
     pub display: String,
+    pub has_rotation: bool,
     pub country: Option<String>,
     /// Exit address from the last successful check. Unlike `display`, this is
     /// not the configured gateway and can therefore differ for rotating proxy
@@ -1186,10 +1187,6 @@ pub struct UiProxy {
     /// From the last exit check, when there was one.
     #[serde(default)]
     pub last_timezone: Option<String>,
-    /// Whether a provider rotation link is saved. The link itself stays in
-    /// local encrypted storage or sealed on the team server.
-    #[serde(default)]
-    pub has_rotation: bool,
 }
 
 #[derive(Serialize)]
@@ -1329,8 +1326,8 @@ async fn local_profiles() -> R<Vec<UiProfile>> {
                 display: format!("{}:{}", x.host, x.port),
                 country: x.last_country,
                 last_ip: x.last_ip,
-                last_timezone: x.last_timezone,
                 has_rotation: x.has_rotation,
+                last_timezone: x.last_timezone,
                 id: x.id,
                 name: x.name,
                 kind: x.kind,
@@ -1383,8 +1380,8 @@ pub async fn profiles(
                     display: format!("{}:{}", x.host, x.port),
                     country: x.last_country,
                     last_ip: x.last_ip,
-                    last_timezone: None,
                     has_rotation: x.has_rotation,
+                    last_timezone: None,
                     id: x.id,
                     name: x.name,
                     kind: x.kind,
@@ -1432,8 +1429,8 @@ pub async fn profiles(
                     display: format!("{}:{}", x.host, x.port),
                     country: x.last_country,
                     last_ip: x.last_ip,
-                    last_timezone: None,
                     has_rotation: x.has_rotation,
+                    last_timezone: None,
                     id: x.id,
                     name: x.name,
                     kind: x.kind,
@@ -1503,8 +1500,8 @@ pub async fn profiles(
                 display: x.display,
                 country: x.country,
                 last_ip: x.last_ip,
+                has_rotation: false,
                 last_timezone: None,
-                has_rotation: x.has_rotation,
             }),
             permissions: p.permissions.iter().map(|v| perm_name(v)).collect(),
             blocklists: Vec::new(),
@@ -2545,7 +2542,6 @@ pub async fn proxies(
                     "last_country": p.country,
                     "last_ip": p.last_ip,
                     "rotate_url": serde_json::Value::Null,
-                    "has_rotation": p.has_rotation,
                     "checker_url": serde_json::Value::Null,
                     "shared_with_profiles": p.shared_with_profiles,
                     // The login and password exist, on the server, sealed: the
@@ -2590,17 +2586,6 @@ pub async fn save_proxy(
     origin: Option<String>,
 ) -> R<serde_json::Value> {
     if local_for(&state, origin.as_deref()) {
-        let clear_rotation = proxy
-            .get("clear_rotation")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let requested_rotation = proxy
-            .get("rotate_url")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| !value.trim().is_empty());
-        if clear_rotation && requested_rotation {
-            return Err(ApiErr::local("Replace or remove the saved rotation link, not both."));
-        }
         return Ok(crate::agent::call("proxies.upsert", proxy).await?);
     }
 
@@ -2614,14 +2599,6 @@ pub async fn save_proxy(
     })?;
 
     let field = |k: &str| proxy.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    let requested_rotation = field("rotate_url").filter(|value| !value.trim().is_empty());
-    let clear_rotation = proxy
-        .get("clear_rotation")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    if clear_rotation && requested_rotation.is_some() {
-        return Err(ApiErr::local("Replace or remove the saved rotation link, not both."));
-    }
     let mut credentials = fury_shared::api::ProxyCredentials {
         username: field("username").filter(|v| !v.is_empty()),
         password: field("password").filter(|v| !v.is_empty()),
@@ -2642,26 +2619,14 @@ pub async fn save_proxy(
     let touching_credentials = id.is_empty()
         || credentials.username.is_some()
         || credentials.password.is_some();
+    // One half typed on an edit: the two are sealed together, so the other
+    // half has to come from what is stored, or it is sealed as nothing. A new
+    // password used to erase the login this way. WireGuard keeps its whole
+    // config in the password and has no login to keep.
     let one_half = credentials.username.is_some() != credentials.password.is_some();
-    let needs_existing_half = one_half && field("kind").as_deref() != Some("wireguard");
-    let has_saved_rotation = match proxy.get("has_rotation").and_then(|value| value.as_bool()) {
-        Some(value) => value,
-        None if !id.is_empty() && touching_credentials => team_proxy_has_rotation(&state, &id).await?,
-        None => false,
-    };
-    if requested_rotation.is_some() || clear_rotation || (touching_credentials && has_saved_rotation) {
-        require_proxy_rotation_capability(&state).await?;
-    }
-    // One authorised read supplies a typed half, opens an existing rotation
-    // link before its proxy data key changes, or supplies that key when a new
-    // link is added. Do not fetch it for a plain rename or explicit removal.
-    let mut stored = if !id.is_empty()
-        && (needs_existing_half
-            || (touching_credentials && has_saved_rotation)
-            || (requested_rotation.is_some() && !touching_credentials))
-    {
-        Some(stored_proxy_credentials(&state, &org_key, &id).await.map_err(|e| {
-            if needs_existing_half && e.status == 403 {
+    if !id.is_empty() && one_half && field("kind").as_deref() != Some("wireguard") {
+        let (_, stored) = stored_proxy_credentials(&state, &org_key, &id).await.map_err(|e| {
+            if e.status == 403 {
                 ApiErr::coded(
                     "err.proxyBothHalves",
                     "Type both the login and the password: they are saved together, and this \
@@ -2670,52 +2635,15 @@ pub async fn save_proxy(
             } else {
                 e
             }
-        })?)
-    } else {
-        None
-    };
-    if !id.is_empty() && needs_existing_half {
-        let (_, existing) = stored.as_ref().ok_or_else(|| ApiErr::local("Could not load the saved proxy credentials."))?;
-        credentials.username = credentials.username.or_else(|| existing.username.clone());
-        credentials.password = credentials.password.or_else(|| existing.password.clone());
+        })?;
+        credentials.username = credentials.username.or(stored.username);
+        credentials.password = credentials.password.or(stored.password);
     }
-
-    let mut new_wrapped_dek = None;
     if touching_credentials {
         let (credentials_enc, wrapped_dek) = crypto::seal_proxy_credentials(&org_key, &credentials)
             .map_err(|e| ApiErr::local(format!("Could not seal the credentials: {e}")))?;
         body["credentials_enc"] = serde_json::json!(hex(&credentials_enc));
         body["wrapped_dek"] = serde_json::json!(hex(&wrapped_dek));
-        new_wrapped_dek = Some(wrapped_dek);
-    }
-
-    if clear_rotation {
-        body["clear_rotation"] = serde_json::json!(true);
-    } else if let Some(rotation_url) = requested_rotation {
-        let wrapped_dek = match (&new_wrapped_dek, stored.as_ref()) {
-            (Some(wrapped_dek), _) => wrapped_dek.clone(),
-            (None, Some((sealed, _))) => proxy_sealed_bytes(sealed, "wrapped_dek")?,
-            (None, None) => return Err(ApiErr::local("Could not load the proxy data key for the rotation link.")),
-        };
-        let rotation = crypto::seal_proxy_rotation_url(&org_key, &rotation_url, &wrapped_dek)
-            .map_err(|e| ApiErr::local(format!("Could not seal the rotation link: {e}")))?;
-        body["rotate_url_enc"] = serde_json::json!(hex(&rotation));
-    } else if !id.is_empty() && touching_credentials && has_saved_rotation {
-        let (sealed, _) = stored.take().ok_or_else(|| ApiErr::local("Could not load the saved rotation link."))?;
-        if sealed.get("rotate_url_enc").and_then(|value| value.as_str()).is_some() {
-            let old_wrapped_dek = proxy_sealed_bytes(&sealed, "wrapped_dek")?;
-            let old_rotation = proxy_sealed_bytes(&sealed, "rotate_url_enc")?;
-            let rotation_url = crypto::open_proxy_rotation_url(&org_key, &old_rotation, &old_wrapped_dek)
-                .map_err(|e| ApiErr::local(format!("Could not open the saved rotation link: {e}")))?;
-            let wrapped_dek = new_wrapped_dek.as_ref().ok_or_else(|| ApiErr::local("Could not seal the new proxy data key."))?;
-            let rotation = crypto::seal_proxy_rotation_url(&org_key, &rotation_url, wrapped_dek)
-                .map_err(|e| ApiErr::local(format!("Could not re-seal the saved rotation link: {e}")))?;
-            body["rotate_url_enc"] = serde_json::json!(hex(&rotation));
-        } else {
-            return Err(ApiErr::local(
-                "The team server did not return the saved rotation link. Update it before changing proxy credentials.",
-            ));
-        }
     }
 
     if id.is_empty() {
@@ -2726,42 +2654,6 @@ pub async fn save_proxy(
             .call(reqwest::Method::PATCH, &format!("/v1/proxies/{id}"), Body::Json(body), true)
             .await
     }
-}
-
-/// Check the server explicitly before a rotation-link mutation. Older servers
-/// ignore unknown JSON keys, which is worse than refusing because it looks as
-/// though a private provider link was saved when it was not.
-async fn require_proxy_rotation_capability(state: &State<'_, AppState>) -> R<()> {
-    let capabilities: serde_json::Value = state
-        .call(reqwest::Method::GET, "/v1/capabilities", Body::None, true)
-        .await
-        .map_err(|error| {
-            if error.status == 404 {
-                ApiErr::local("This team server does not support saved proxy rotation links. Update it before saving this change.")
-            } else {
-                error
-            }
-        })?;
-    if capabilities.get("proxy_rotation").and_then(|value| value.as_bool()) != Some(true) {
-        return Err(ApiErr::local(
-            "This team server does not support saved proxy rotation links. Update it before saving this change.",
-        ));
-    }
-    Ok(())
-}
-
-/// UI state normally carries the list's boolean through an edit, but native
-/// code resolves it itself when an older caller omitted the field. It is
-/// metadata only: no credentials or provider URL leave the server here.
-async fn team_proxy_has_rotation(state: &State<'_, AppState>, id: &str) -> R<bool> {
-    let proxies: Vec<ProxySummary> = state
-        .call(reqwest::Method::GET, "/v1/proxies", Body::None, true)
-        .await?;
-    Ok(proxies
-        .into_iter()
-        .find(|proxy| proxy.id.to_string() == id)
-        .map(|proxy| proxy.has_rotation)
-        .unwrap_or(false))
 }
 
 /// The URL the agent's `parse_upstream` reads. A WireGuard proxy's secret is
@@ -2791,32 +2683,19 @@ async fn stored_proxy_credentials(
     let sealed: serde_json::Value = state
         .call(reqwest::Method::GET, &format!("/v1/proxies/{id}/credentials"), Body::None, true)
         .await?;
-    let creds = crypto::open_proxy_credentials(
-        org_key,
-        &proxy_sealed_bytes(&sealed, "credentials_enc")?,
-        &proxy_sealed_bytes(&sealed, "wrapped_dek")?,
-    )
+    let hex = |k: &str| -> R<Vec<u8>> {
+        let v = sealed.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        (0..v.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(v.get(i..i + 2).unwrap_or(""), 16)
+                    .map_err(|_| ApiErr::local(format!("{k} is not hex")))
+            })
+            .collect()
+    };
+    let creds = crypto::open_proxy_credentials(org_key, &hex("credentials_enc")?, &hex("wrapped_dek")?)
         .map_err(|e| ApiErr::local(format!("Could not open this proxy's credentials: {e}")))?;
     Ok((sealed, creds))
-}
-
-/// Read one opaque server ciphertext. Its contents never reach the webview;
-/// this is only the native boundary before an organisation key opens it.
-fn proxy_sealed_bytes(sealed: &serde_json::Value, key: &str) -> R<Vec<u8>> {
-    let value = sealed
-        .get(key)
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiErr::local(format!("The team server did not return {key}; update it before using this proxy.")))?;
-    if value.len() % 2 != 0 || !value.is_ascii() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ApiErr::local(format!("{key} is not hex")));
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&value[i..i + 2], 16)
-                .map_err(|_| ApiErr::local(format!("{key} is not hex")))
-        })
-        .collect()
 }
 
 /// The proxy as a URL the agent can dial. In local mode that is what the
@@ -2826,8 +2705,9 @@ async fn resolve_proxy_url(
     state: &State<'_, AppState>,
     url: String,
     proxy_id: Option<String>,
+    origin: Option<&str>,
 ) -> R<String> {
-    let url = match proxy_id.filter(|_| mode_of(&state) != "local") {
+    let url = match proxy_id.filter(|_| !local_for(state, origin)) {
         None => url,
         Some(id) => {
             let org_key = state.org_key().ok_or_else(|| {
@@ -2848,62 +2728,6 @@ async fn resolve_proxy_url(
     Ok(url)
 }
 
-/// A stored team proxy is decrypted in this process, then checked by the local
-/// agent. The server returns an opaque configuration version alongside the
-/// already-authorised ciphertext; a successful observation is accepted only
-/// while that exact upstream is still stored there.
-struct TeamProxyCheck {
-    id: String,
-    check_version: String,
-}
-
-async fn resolve_proxy_check(
-    state: &State<'_, AppState>,
-    url: String,
-    proxy_id: Option<String>,
-    origin: Option<&str>,
-) -> R<(String, Option<String>, Option<TeamProxyCheck>)> {
-    let stored_check = url.trim().is_empty();
-    if local_for(state, origin) {
-        // Passing an id only for a stored check matters: the agent resolves a
-        // blank URL from its local encrypted store and writes the result only
-        // when that configuration is still current. A form's typed URL may be
-        // unsaved and must neither be replaced nor persisted.
-        return Ok((url, stored_check.then_some(proxy_id).flatten(), None));
-    }
-
-    // Preserve the existing team form behaviour: a team proxy id has always
-    // caused this process to use sealed, saved credentials rather than expose
-    // a password to the webview. Only a deliberately blank URL is a stored
-    // row check and gains result persistence.
-    let Some(id) = proxy_id else {
-        return Ok((url, None, None));
-    };
-    let org_key = state.org_key().ok_or_else(|| {
-        ApiErr::coded(
-            "err.noOrgKeySeal",
-            "This machine does not hold the organisation key, so it cannot open this \
-             proxy's credentials to check it.",
-        )
-    })?;
-    let (sealed, creds) = stored_proxy_credentials(state, &org_key, &id).await?;
-    let field = |key: &str| sealed.get(key).and_then(|value| value.as_str()).unwrap_or_default();
-    let port = sealed.get("port").and_then(|value| value.as_i64()).unwrap_or(0);
-    let resolved = proxy_url(field("kind"), field("host"), port, creds.username, creds.password);
-    let stored = if stored_check {
-        let check_version = field("check_version").to_string();
-        if check_version.is_empty() {
-            return Err(ApiErr::local(
-                "The team server did not return a proxy check version. Update the team server before checking saved proxies.",
-            ));
-        }
-        Some(TeamProxyCheck { id, check_version })
-    } else {
-        None
-    };
-    Ok((resolved, None, stored))
-}
-
 #[tauri::command]
 pub async fn check_proxy(
     state: State<'_, AppState>,
@@ -2913,47 +2737,19 @@ pub async fn check_proxy(
     // interface has no password to build a URL from, so the credentials are
     // fetched and opened here instead.
     proxy_id: Option<String>,
-    // A connected shell can show local and team rows together. When absent,
-    // retain the older mode-based behaviour for form callers.
     origin: Option<String>,
 ) -> R<serde_json::Value> {
-    let (url, stored_id, team_proxy) =
-        resolve_proxy_check(&state, url, proxy_id, origin.as_deref()).await?;
+    let stored_id = proxy_id.clone().filter(|_| local_for(&state, origin.as_deref()));
+    let url = resolve_proxy_url(&state, url, proxy_id, origin.as_deref()).await?;
     // The check itself always runs on this machine, in both modes: it is the
     // machine whose exit the answer describes.
-    let result: serde_json::Value = crate::agent::call(
+    Ok(crate::agent::call(
         "proxies.check",
         // The id, when there is one, so the agent can remember what it learned
         // and a launch that follows this exit does not ask again.
         serde_json::json!({ "url": url, "checker_url": checker_url, "id": stored_id }),
     )
-    .await?;
-
-    if let Some(proxy) = team_proxy {
-        if result.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-            let ip = result
-                .get("ip")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| ApiErr::local("The proxy checker did not return an IP address."))?;
-            let country = result.get("country").and_then(|value| value.as_str());
-            let timezone = result.get("timezone").and_then(|value| value.as_str());
-            let _: serde_json::Value = state
-                .call(
-                    reqwest::Method::POST,
-                    &format!("/v1/proxies/{}/check", proxy.id),
-                    Body::Json(serde_json::json!({
-                        "check_version": proxy.check_version,
-                        "ip": ip,
-                        "country": country,
-                        "timezone": timezone,
-                    })),
-                    true,
-                )
-                .await?;
-        }
-    }
-
-    Ok(result)
+    .await?)
 }
 
 /// The check step by step, with the first failure named — see
@@ -2966,7 +2762,7 @@ pub async fn diagnose_proxy(
     proxy_id: Option<String>,
 ) -> R<serde_json::Value> {
     let stored_id = proxy_id.clone();
-    let url = resolve_proxy_url(&state, url, proxy_id).await?;
+    let url = resolve_proxy_url(&state, url, proxy_id, None).await?;
     Ok(crate::agent::call(
         "proxies.diagnose",
         serde_json::json!({ "url": url, "checker_url": checker_url, "id": stored_id }),
@@ -2975,58 +2771,15 @@ pub async fn diagnose_proxy(
 }
 
 #[tauri::command]
-pub async fn rotate_proxy(
-    state: State<'_, AppState>,
-    id: String,
-    origin: Option<String>,
-) -> R<serde_json::Value> {
-    if local_for(&state, origin.as_deref()) {
-        return Ok(crate::agent::call("proxies.rotate", serde_json::json!({ "id": id })).await?);
+pub async fn rotate_proxy(state: State<'_, AppState>, id: String, origin: Option<String>) -> R<serde_json::Value> {
+    if !local_for(&state, origin.as_deref()) {
+        return Err(ApiErr::coded(
+            "err.proxyCheckNotBuilt",
+            "Checking a proxy on a team server is not built yet — its credentials are sealed, and \
+             the check would run without them.",
+        ));
     }
-
-    require_proxy_rotation_capability(&state).await?;
-    let org_key = state.org_key().ok_or_else(|| {
-        ApiErr::coded(
-            "err.noOrgKeySeal",
-            "This machine does not hold the organisation key, so it cannot use this proxy's saved rotation link.",
-        )
-    })?;
-    let (sealed, credentials) = stored_proxy_credentials(&state, &org_key, &id).await?;
-    let rotation_ciphertext = proxy_sealed_bytes(&sealed, "rotate_url_enc").map_err(|_| {
-        ApiErr::local("This proxy has no saved rotation link, or the team server is too old to return it.")
-    })?;
-    let wrapped_dek = proxy_sealed_bytes(&sealed, "wrapped_dek")?;
-    let rotation_url = crypto::open_proxy_rotation_url(&org_key, &rotation_ciphertext, &wrapped_dek)
-        .map_err(|e| ApiErr::local(format!("Could not open the saved rotation link: {e}")))?;
-    let rotation_version = sealed
-        .get("rotation_version")
-        .and_then(|value| value.as_str())
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| ApiErr::local(
-            "The team server did not return a proxy rotation version. Update it before rotating saved proxies.",
-        ))?;
-    let field = |key: &str| sealed.get(key).and_then(|value| value.as_str()).unwrap_or_default();
-    let port = sealed.get("port").and_then(|value| value.as_i64()).unwrap_or(0);
-    let url = proxy_url(field("kind"), field("host"), port, credentials.username, credentials.password);
-    let result: serde_json::Value = crate::agent::call(
-        "proxies.rotate_url",
-        serde_json::json!({ "url": url, "rotate_url": rotation_url }),
-    )
-    .await?;
-    if result.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-        let _: serde_json::Value = state
-            .call(
-                reqwest::Method::POST,
-                &format!("/v1/proxies/{id}/rotate"),
-                Body::Json(serde_json::json!({ "rotation_version": rotation_version })),
-                true,
-            )
-            .await
-            .map_err(|_| ApiErr::local(
-                "Rotation request succeeded, but Fury could not clear its previous check result. Check the proxy again before using it.",
-            ))?;
-    }
-    Ok(result)
+    Ok(crate::agent::call("proxies.rotate", serde_json::json!({ "id": id })).await?)
 }
 
 #[tauri::command]
@@ -3237,8 +2990,8 @@ pub async fn trash(state: State<'_, AppState>) -> R<Vec<UiProfile>> {
                 display: format!("{}:{}", x.host, x.port),
                 country: x.last_country,
                 last_ip: x.last_ip,
-                last_timezone: None,
                 has_rotation: x.has_rotation,
+                last_timezone: None,
                 id: x.id,
                 name: x.name,
                 kind: x.kind,
@@ -4534,8 +4287,8 @@ pub async fn shared_with_me(state: State<'_, AppState>) -> R<Vec<UiProfile>> {
                 display,
                 country: None,
                 last_ip: None,
-                last_timezone: None,
                 has_rotation: false,
+                last_timezone: None,
             }),
             timezone: None,
             languages: None,

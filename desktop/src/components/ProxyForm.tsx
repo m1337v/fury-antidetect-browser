@@ -73,12 +73,6 @@ export function ProxyForm({
   const [user, setUser] = useState(editing?.username ?? "");
   const [pass, setPass] = useState(editing?.password ?? "");
   const [rotate, setRotate] = useState(editing?.rotate_url ?? "");
-  /** Team reads intentionally omit the secret rotation URL. An empty field
-   *  therefore preserves it; removal must be an explicit operator action. */
-  const [clearRotation, setClearRotation] = useState(false);
-  /** A local link can be put back on Cancel; a team link remains unknown and
-   *  blank, where cancelling simply restores its preserve-on-blank state. */
-  const [removedRotationUrl, setRemovedRotationUrl] = useState<string | null>(null);
   const [checker, setChecker] = useState(editing?.checker_url ?? "");
   const [check, setCheck] = useState<{
     ok: boolean; error?: string; ip?: string; country?: string;
@@ -240,36 +234,9 @@ export function ProxyForm({
             <label htmlFor="f-rotate">{t("px.rotate")}</label>
             <div>
               <input id="f-rotate" value={rotate} readOnly={locked !== null} autoComplete="off"
-                placeholder={locked ? "—" : editing?.sealed && editing.has_rotation && removedRotationUrl === null
-                  ? `${t("px.rotate")}: ${t("px.saved")}`
-                  : "https://provider.example/rotate?key=…"}
-                onChange={(e) => {
-                  setRotate(e.target.value);
-                  setClearRotation(false);
-                  setRemovedRotationUrl(null);
-                }} />
-              {editing && (editing.has_rotation || !!editing.rotate_url) && !locked ? (
-                <p className="hint">
-                  {removedRotationUrl !== null
-                    ? `${t("px.rotate")}: ${t("ui.delete")}.`
-                    : editing.sealed
-                      ? t("px.rotateSaved")
-                      : `${t("px.rotate")}: ${t("px.saved")}.`}{" "}
-                  <button className="linky" type="button" onClick={() => {
-                    if (removedRotationUrl !== null) {
-                      setRotate(removedRotationUrl);
-                      setRemovedRotationUrl(null);
-                      setClearRotation(false);
-                    } else {
-                      setRemovedRotationUrl(rotate);
-                      setRotate("");
-                      setClearRotation(true);
-                    }
-                  }}>
-                    {removedRotationUrl !== null ? t("ui.cancel") : t("bm.remove")}
-                  </button>
-                </p>
-              ) : !locked && <p className="hint">{t("px.rotateHint")}</p>}
+                placeholder={locked ? "—" : "https://provider.example/rotate?key=…"}
+                onChange={(e) => setRotate(e.target.value)} />
+              {!locked && <p className="hint">{t("px.rotateHint")}</p>}
             </div>
           </div>}
 
@@ -301,8 +268,7 @@ export function ProxyForm({
                   password: wg ? (conf || null) : (pass || null),
                   last_country: check?.country ?? editing?.last_country ?? null,
                   last_ip: check?.ip ?? editing?.last_ip ?? null,
-                  rotate_url: wg || clearRotation ? null : (rotate.trim() || null),
-                  clear_rotation: !wg && clearRotation,
+                  rotate_url: wg ? null : (rotate.trim() || null),
                   checker_url: checker.trim() || null,
                 });
                 onSaved(saved.id);

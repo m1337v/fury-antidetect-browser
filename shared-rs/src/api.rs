@@ -96,9 +96,6 @@ pub struct ProxySummary {
     /// Omitted for callers without `reveal_secrets` and by older servers.
     #[serde(default)]
     pub last_ip: Option<String>,
-    /// A provider rotation link is saved, without exposing that secret link.
-    #[serde(default)]
-    pub has_rotation: bool,
     pub detected_kind: Option<String>,
     pub last_checked_at: Option<String>,
     /// How many other profiles share this exact proxy. Shown in the UI because

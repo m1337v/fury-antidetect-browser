@@ -248,7 +248,6 @@ export function BulkProfiles({
                           <option
                             key={p.id}
                             value={p.id}
-                            data-search={`${p.name} ${p.host} ${p.port} ${p.last_country ?? ""}`}
                           >
                             <span className="proxySelectName">{p.name}</span>
                             <span className="proxySelectJoiner"> · </span>

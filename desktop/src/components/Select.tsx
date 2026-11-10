@@ -37,7 +37,6 @@ type Opt = {
   value: string;
   label: string;
   content: ReactNode;
-  search: string;
   disabled: boolean;
   heading?: boolean;
 };
@@ -59,7 +58,7 @@ function text(node: ReactNode): string {
  *  behind a `cond && (...)`. */
 function collect(children: ReactNode, out: Opt[] = []): Opt[] {
   Children.forEach(children, (child) => {
-    if (!isValidElement<{ value?: unknown; disabled?: boolean; children?: ReactNode; "data-search"?: unknown }>(child)) return;
+    if (!isValidElement<{ value?: unknown; disabled?: boolean; children?: ReactNode }>(child)) return;
     if (child.type === Fragment) {
       collect(child.props.children, out);
       return;
@@ -68,7 +67,7 @@ function collect(children: ReactNode, out: Opt[] = []): Opt[] {
     // option can have, so a heading is never the selected row.
     if (child.type === "optgroup") {
       const label = String((child.props as { label?: unknown }).label ?? "");
-      out.push({ value: `\u0000group:${label}`, label, content: label, search: label, disabled: true, heading: true });
+      out.push({ value: `\u0000group:${label}`, label, content: label, disabled: true, heading: true });
       collect(child.props.children, out);
       return;
     }
@@ -78,9 +77,6 @@ function collect(children: ReactNode, out: Opt[] = []): Opt[] {
         value: child.props.value === undefined ? label : String(child.props.value),
         label,
         content: child.props.children,
-        // Search text is opt-in so a caller can expose only values that are
-        // already safe to show. Proxy credentials must never become searchable.
-        search: typeof child.props["data-search"] === "string" ? child.props["data-search"] : label,
         disabled: !!child.props.disabled,
       });
     }
@@ -132,7 +128,7 @@ export function Select({
   const listId = useId();
   const shown = !searchable || !query.trim()
     ? options
-    : options.filter((o) => o.heading || o.search.toLowerCase().includes(query.trim().toLowerCase()));
+    : options.filter((o) => o.heading || o.label.toLowerCase().includes(query.trim().toLowerCase()));
 
   const choose = (i: number) => {
     const o = shown[i];

@@ -10,7 +10,7 @@ import { useAsk } from "./Ask";
 import { ProxyForm, addedByMe, proxyLock } from "./ProxyForm";
 import { ProxyPaste } from "./ProxyPaste";
 import { PartnerCard } from "./Partner";
-import type { ProxyCheckState, ProxyRotationState } from "../proxyCheck";
+import type { ProxyOperation } from "../proxyCheck";
 
 /** The proxies this machine knows about.
  *
@@ -26,26 +26,22 @@ export function Proxies({
   canCheck,
   canRotate,
   onCheckProxy,
-  proxyCheckFor,
   onRotateProxy,
-  proxyRotationFor,
+  proxyOperationFor,
   onProxySaved,
 }: {
   profiles: Profile[];
   local: boolean;
   myEmail?: string | null;
-  /** Team proxy checks require the same organisation-wide secret permission
-   *  as the sealed credential endpoint. */
+  /** Team checks require the same organisation-wide secret permission as the
+   * sealed credential endpoint. */
   canCheck: boolean;
-  /** Rotation changes a shared proxy and is therefore limited to people who
-   *  may edit it, even though its saved URL is never revealed here. */
+  /** Rotation remains local until the team server grows a matching endpoint. */
   canRotate: boolean;
-  /** The parent owns checks so a profile row and this table cannot run two
-   *  requests for the same saved proxy. `true` means the stored exit changed. */
+  /** The parent owns requests so profile and proxy rows share one result. */
   onCheckProxy: (proxy: LocalProxy) => Promise<boolean>;
-  proxyCheckFor: (proxy: LocalProxy) => ProxyCheckState | undefined;
   onRotateProxy: (proxy: LocalProxy) => Promise<boolean>;
-  proxyRotationFor: (proxy: LocalProxy) => ProxyRotationState | undefined;
+  proxyOperationFor: (proxy: LocalProxy) => ProxyOperation | undefined;
   /** A proxy edit makes any cached row-check outcome stale. */
   onProxySaved?: (id: string) => void;
 }) {
@@ -59,6 +55,30 @@ export function Proxies({
   // Check all is deliberately an operator action. Its progress is separate
   // from the shared per-proxy state, so one pending row never freezes another.
   const [checking, setChecking] = useState<{ done: number; total: number } | null>(null);
+
+  const checkAll = async () => {
+    if (!canCheck) return;
+    const list = rows.filter((proxy) => proxyOperationFor(proxy)?.status !== "pending");
+    if (list.length === 0) return;
+    setChecking({ done: 0, total: list.length });
+    let done = 0;
+    let changed = false;
+    // Three at a time: the checker is a third party, and forty simultaneous
+    // requests from one address is how a checker starts refusing.
+    const queue = [...list];
+    const worker = async () => {
+      for (;;) {
+        const proxy = queue.shift();
+        if (!proxy) return;
+        changed = (await onCheckProxy(proxy)) || changed;
+        done++;
+        setChecking({ done, total: list.length });
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    setChecking(null);
+    if (changed) await load();
+  };
 
   /** Local proxies whose password the keychain will not open now. They read
    *  back blank, and nothing used to say so: a tester re-typed every one after
@@ -82,74 +102,12 @@ export function Proxies({
     void load();
   }, [load]);
 
-  const runCheck = async (proxy: LocalProxy) => {
-    try {
-      return await onCheckProxy(proxy);
-    } catch (e) {
-      setError(say(e));
-      return false;
-    }
-  };
-
-  const checkOne = async (proxy: LocalProxy) => {
-    const changed = await runCheck(proxy);
-    if (changed) await load();
-  };
-
-  const runRotation = async (proxy: LocalProxy) => {
-    try {
-      return await onRotateProxy(proxy);
-    } catch (e) {
-      setError(say(e));
-      return false;
-    }
-  };
-
-  const rotateOne = async (proxy: LocalProxy) => {
-    const rotated = await runRotation(proxy);
-    if (!rotated) return;
-    // The provider accepted the request, not proof that a new IP has appeared.
-    // Mirror the persisted metadata clear even if the following list request
-    // did not return, so this table never keeps showing the old checked exit.
-    setRows((saved) => saved.map((row) => row.id === proxy.id
-      ? { ...row, last_country: null, last_ip: null, last_timezone: null }
-      : row));
-  };
-
-  const checkAll = async () => {
-    if (!canCheck) return;
-    // Do not enqueue a second request for an exit already being checked from a
-    // profile row. The parent also deduplicates, this avoids misleading batch
-    // progress for a request this button did not start.
-    const list = rows.filter((proxy) => (
-      proxyCheckFor(proxy)?.state !== "checking"
-      && proxyRotationFor(proxy)?.state !== "rotating"
-    ));
-    if (list.length === 0) return;
-    setChecking({ done: 0, total: list.length });
-    let done = 0;
-    let changed = false;
-    // Three at a time: the checker is a third party, and forty simultaneous
-    // requests from one address is how a checker starts refusing.
-    const queue = [...list];
-    const worker = async () => {
-      for (;;) {
-        const proxy = queue.shift();
-        if (!proxy) return;
-        changed = (await runCheck(proxy)) || changed;
-        done++;
-        setChecking({ done, total: list.length });
-      }
-    };
-    await Promise.all([worker(), worker(), worker()]);
-    setChecking(null);
-    if (changed) await load();
-  };
-
   const usedBy = (id: string) => profiles.filter((p) => p.proxy?.id === id).length;
-  const checkResults = rows
-    .map(proxyCheckFor)
-    .filter((check): check is ProxyCheckState => check?.state === "ok" || check?.state === "error");
+  const checkResults = rows.reduce<ProxyOperation[]>((results, proxy) => {
+    const operation = proxyOperationFor(proxy);
+    if (operation?.action === "check" && operation.status !== "pending") results.push(operation);
+    return results;
+  }, []);
 
   return (
     <>
@@ -166,7 +124,7 @@ export function Proxies({
         )}
         {!checking && checkResults.length > 0 && (
           <span className="muted small">
-            {t("px.checkSummary", { ok: checkResults.filter((check) => check.state === "ok").length, bad: checkResults.filter((check) => check.state === "error").length })}
+            {t("px.checkSummary", { ok: checkResults.filter((check) => check.status === "ok").length, bad: checkResults.filter((check) => check.status === "error").length })}
           </span>
         )}
         <div className="spacer" />
@@ -217,21 +175,26 @@ export function Proxies({
             </thead>
             <tbody>
               {rows.map((p) => {
-                const check = proxyCheckFor(p);
-                const rotation = proxyRotationFor(p);
-                const operationPending = check?.state === "checking" || rotation?.state === "rotating";
-                const exitCleared = rotation?.accepted || rotation?.state === "ok";
+                const operation = proxyOperationFor(p);
+                const check = operation?.action === "check" ? operation : undefined;
+                const rotation = operation?.action === "rotate" ? operation : undefined;
+                const operationPending = operation?.status === "pending";
+                const checkState = check?.status === "pending" ? "checking" : check?.status ?? "idle";
+                const rotationState = rotation?.status === "pending" ? "rotating" : rotation?.status ?? "idle";
+                const observedExit = operation?.exit === undefined
+                  ? { ip: p.last_ip, country: p.last_country }
+                  : operation.exit;
                 const locked = proxyLock(p, myEmail, t);
-                const checkLabel = check?.state === "checking" ? t("px.checking") : t("px.check");
-                const checkTitle = check?.state === "ok"
+                const checkLabel = checkState === "checking" ? t("px.checking") : t("px.check");
+                const checkTitle = check?.status === "ok"
                   ? t("px.checkOk", { ms: check.ms ?? 0 })
-                  : check?.state === "error"
+                  : check?.status === "error"
                     ? check.error ?? t("px.checkBad")
                     : checkLabel;
-                const rotationLabel = rotation?.state === "rotating" ? t("px.rotating") : t("px.rotateNow");
-                const rotationTitle = rotation?.state === "ok" || rotation?.accepted
+                const rotationLabel = rotationState === "rotating" ? t("px.rotating") : t("px.rotateNow");
+                const rotationTitle = rotation?.status === "ok"
                   ? t("px.rotated")
-                  : rotation?.state === "error"
+                  : rotation?.status === "error"
                     ? rotation.error ?? t("px.checkBad")
                     : rotationLabel;
                 return (
@@ -248,19 +211,19 @@ export function Proxies({
                       {p.username && <div className="muted small">{p.username}</div>}
                     </td>
                     <td className="muted small">
-                      {exitCleared ? "—" : p.last_ip ?? "—"}
-                      {!exitCleared && p.last_country && (
+                      {observedExit?.ip ?? "—"}
+                      {observedExit?.country && (
                         <>
                           {" · "}
-                          <span className="flag">{flag(p.last_country)}</span> {p.last_country}
+                          <span className="flag">{flag(observedExit.country)}</span> {observedExit.country}
                         </>
                       )}
-                      {check && check.state !== "checking" && (check.state === "ok" ? (
+                      {check && check.status !== "pending" && (check.status === "ok" ? (
                         <div className="ok">{t("px.checkOk", { ms: check.ms ?? 0 })}</div>
                       ) : (
                         <div className="warn" title={check.error}>{t("px.checkBad")}</div>
                       ))}
-                      {rotation && rotation.state !== "rotating" && (rotation.state === "ok" ? (
+                      {rotation && rotation.status !== "pending" && (rotation.status === "ok" ? (
                         <div className="ok">{t("px.rotated")}</div>
                       ) : (
                         <div className="warn" title={rotation.error}>{t("px.checkBad")}</div>
@@ -274,24 +237,24 @@ export function Proxies({
                       {/* Check is first because it describes the exit; editing
                           and deletion remain the table's ordinary actions. */}
                       {canCheck && (
-                        <span className={`proxyTableCheck proxyCheck-${check?.state ?? "idle"}`}>
+                        <span className={`proxyTableCheck proxyCheck-${checkState}`}>
                           <IconButton
                             icon="check"
                             label={checkLabel}
                             title={checkTitle}
                             disabled={operationPending}
-                            onClick={() => void checkOne(p)}
+                            onClick={() => void onCheckProxy(p)}
                           />
                         </span>
                       )}
-                      {canRotate && p.has_rotation && locked === null && (
-                        <span className={`proxyTableRotate proxyRotate-${rotation?.state ?? "idle"}`}>
+                      {canRotate && !!p.rotate_url && locked === null && (
+                        <span className={`proxyTableRotate proxyRotate-${rotationState}`}>
                           <IconButton
                             icon="refresh"
                             label={rotationLabel}
                             title={rotationTitle}
                             disabled={operationPending}
-                            onClick={() => void rotateOne(p)}
+                            onClick={() => void onRotateProxy(p)}
                           />
                         </span>
                       )}

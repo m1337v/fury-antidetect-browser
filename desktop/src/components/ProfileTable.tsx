@@ -9,7 +9,7 @@ import type { Me, Profile } from "../api";
 import { platformOf } from "../platform";
 import { assess } from "../consistency";
 import { isSuggested, statusHue } from "../status";
-import type { ProxyCheckState, ProxyRotationState } from "../proxyCheck";
+import type { ProxyOperation } from "../proxyCheck";
 
 /** Every row's controls follow the permissions the SERVER resolved. Hiding a
  *  button is presentation, not protection — the server refuses regardless — but
@@ -65,9 +65,8 @@ export function ProfileTable({
   onEdit,
   onEditProxy,
   onCheckProxy,
-  proxyCheckFor,
   onRotateProxy,
-  proxyRotationFor,
+  proxyOperationFor,
   onDelete,
   onExtensions,
   onShare,
@@ -99,11 +98,9 @@ export function ProfileTable({
   /** Checks this profile's saved proxy. The caller owns the request because
    *  local and team proxies may have the same id. */
   onCheckProxy?: (p: Profile) => void;
-  proxyCheckFor?: (p: Profile) => ProxyCheckState | undefined;
-  /** Asks a provider with a saved rotation link for a new exit. This is only
-   *  offered to people who may change that proxy; it never checks it after. */
+  /** Local rotation asks its provider for a new exit; it never checks after. */
   onRotateProxy?: (p: Profile) => void;
-  proxyRotationFor?: (p: Profile) => ProxyRotationState | undefined;
+  proxyOperationFor?: (p: Profile) => ProxyOperation | undefined;
   onDelete?: (p: Profile) => void;
   /** Extensions and disk usage — the two things beside the browser data. */
   onExtensions?: (p: Profile) => void;
@@ -236,9 +233,7 @@ export function ProfileTable({
           const canCheckProxy = p.origin === "local"
             ? canReveal
             : me?.role === "owner" || me?.role === "admin";
-          const canRotateProxy = !!p.proxy?.has_rotation
-            && canEditProxy
-            && (p.origin === "local" || me?.role === "owner" || me?.role === "admin");
+          const canRotateProxy = p.origin === "local" && !!p.proxy?.has_rotation && canEditProxy;
           const locked = p.lock !== null;
           const open = isOpenHere(p, { local, userId: me?.user_id, machine: thisMachine });
           const starting = launching?.has(p.id) ?? false;
@@ -258,21 +253,27 @@ export function ProfileTable({
             p.proxy && !canReveal ? t("row.masked") : "",
             p.proxy && shared >= 2 ? t("row.sharedExit", { n: shared }) : "",
           ].filter(Boolean).join(" · ");
-          const proxyCheck = p.proxy ? proxyCheckFor?.(p) : undefined;
-          const proxyRotation = p.proxy ? proxyRotationFor?.(p) : undefined;
-          const proxyOperationPending = proxyCheck?.state === "checking" || proxyRotation?.state === "rotating";
-          const checkLabel = proxyCheck?.state === "checking" ? t("px.checking") : t("px.check");
-          const checkTitle = proxyCheck?.state === "ok"
+          const proxyOperation = p.proxy ? proxyOperationFor?.(p) : undefined;
+          const proxyCheck = proxyOperation?.action === "check" ? proxyOperation : undefined;
+          const proxyRotation = proxyOperation?.action === "rotate" ? proxyOperation : undefined;
+          const proxyOperationPending = proxyOperation?.status === "pending";
+          const checkState = proxyCheck?.status === "pending" ? "checking" : proxyCheck?.status ?? "idle";
+          const rotationState = proxyRotation?.status === "pending" ? "rotating" : proxyRotation?.status ?? "idle";
+          const checkLabel = checkState === "checking" ? t("px.checking") : t("px.check");
+          const checkTitle = proxyCheck?.status === "ok"
             ? t("px.checkOk", { ms: proxyCheck.ms ?? 0 })
-            : proxyCheck?.state === "error"
+            : proxyCheck?.status === "error"
               ? proxyCheck.error ?? t("px.checkBad")
               : checkLabel;
-          const rotationLabel = proxyRotation?.state === "rotating" ? t("px.rotating") : t("px.rotateNow");
-          const rotationTitle = proxyRotation?.state === "ok" || proxyRotation?.accepted
+          const rotationLabel = rotationState === "rotating" ? t("px.rotating") : t("px.rotateNow");
+          const rotationTitle = proxyRotation?.status === "ok"
             ? t("px.rotated")
-            : proxyRotation?.state === "error"
+            : proxyRotation?.status === "error"
               ? proxyRotation.error ?? t("px.checkBad")
               : rotationLabel;
+          const observedExit = proxyOperation?.exit === undefined
+            ? { country: p.proxy?.country, ip: exitIp }
+            : proxyOperation.exit && { country: proxyOperation.exit.country, ip: canReveal ? proxyOperation.exit.ip : undefined };
 
           return (
             <tr key={p.id} data-row className={selected.has(p.id) ? "picked" : undefined}>
@@ -354,7 +355,7 @@ export function ProfileTable({
                     <div className="proxyLabelRow">
                       {onCheckProxy && canCheckProxy && (
                         <span
-                          className={`proxyCheck proxyCheck-${proxyCheck?.state ?? "idle"}`}
+                          className={`proxyCheck proxyCheck-${checkState}`}
                           onClick={(e) => e.stopPropagation()}
                         >
                           <IconButton
@@ -368,7 +369,7 @@ export function ProfileTable({
                       )}
                       {onRotateProxy && canRotateProxy && (
                         <span
-                          className={`proxyRotate proxyRotate-${proxyRotation?.state ?? "idle"}`}
+                          className={`proxyRotate proxyRotate-${rotationState}`}
                           onClick={(e) => e.stopPropagation()}
                         >
                           <IconButton
@@ -389,11 +390,11 @@ export function ProfileTable({
                         </span>
                       )}
                     </div>
-                    {(p.proxy.country || exitIp) && (
+                    {observedExit && (observedExit.country || observedExit.ip) && (
                       <div className="proxyExit muted small">
-                        {p.proxy.country && <><span className="flag">{flag(p.proxy.country)}</span> {p.proxy.country}</>}
-                        {p.proxy.country && exitIp && " · "}
-                        {exitIp && <span className="mono">{exitIp}</span>}
+                        {observedExit.country && <><span className="flag">{flag(observedExit.country)}</span> {observedExit.country}</>}
+                        {observedExit.country && observedExit.ip && " · "}
+                        {observedExit.ip && <span className="mono">{observedExit.ip}</span>}
                       </div>
                     )}
                   </div>

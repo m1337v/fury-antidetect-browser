@@ -57,6 +57,8 @@ pub struct LocalProxy {
     pub kind: String,
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub has_rotation: bool,
     pub last_country: Option<String>,
     /// Exit address from the last successful local proxy check. This is not
     /// necessarily the configured host for a rotating proxy provider.
@@ -66,8 +68,6 @@ pub struct LocalProxy {
     /// "follow the exit" will resolve to.
     #[serde(default)]
     pub last_timezone: Option<String>,
-    #[serde(default)]
-    pub has_rotation: bool,
     /// Only ever filled for a proxy of THIS machine's, where the agent keeps
     /// them readable because there is nobody to hide them from.
     ///
