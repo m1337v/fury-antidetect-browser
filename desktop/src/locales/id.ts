@@ -777,6 +777,8 @@ export const id: Record<Key, string> = {
   "px.configure": "Konfigurasi",
   "px.newInline": "Proxy baru…",
   "px.saved": "Tersimpan",
+  "px.searchSaved": "Cari proksi tersimpan",
+  "px.noSearchResults": "Tidak ada proksi yang cocok.",
   "px.none": "Belum ada proxy. Profil tidak dapat dibuka tanpa proxy.",
   "partner.intro": "Layanan yang cocok dengan Fury, dengan diskon untuk penggunanya.",
   "partner.badge": "mitra",

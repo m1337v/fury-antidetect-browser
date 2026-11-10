@@ -2010,6 +2010,24 @@ button.selectBtn:disabled {
   cursor: default;
 }
 
+.selectSearch {
+  position: sticky;
+  top: -4px;
+  z-index: 1;
+  padding: 2px 2px 6px;
+  background: var(--surface);
+}
+
+.selectSearch input {
+  width: 100%;
+}
+
+.selectEmpty {
+  padding: 8px 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .selectCheck {
   flex: none;
   width: 14px;
@@ -2020,6 +2038,23 @@ button.selectBtn:disabled {
 .selectLabel {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* A saved proxy's name is the thing an operator remembers. The endpoint and
+   checked country remain visible enough to distinguish duplicate labels. */
+.proxySelectName,
+.proxySelectDetail {
+  display: block;
+}
+
+.proxySelectDetail {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.proxySelectJoiner {
+  display: none;
 }
 
 /* ---- the application's own calendar (components/DatePicker.tsx) -------- */

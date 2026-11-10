@@ -777,6 +777,8 @@ export const vi: Record<Key, string> = {
   "px.configure": "Cấu hình",
   "px.newInline": "Proxy mới…",
   "px.saved": "Đã lưu",
+  "px.searchSaved": "Tìm proxy đã lưu",
+  "px.noSearchResults": "Không có proxy phù hợp.",
   "px.none": "Chưa có proxy nào. Hồ sơ không có proxy thì không mở được.",
   "partner.intro": "Các dịch vụ hợp với Fury, có giảm giá cho người dùng của nó.",
   "partner.badge": "đối tác",

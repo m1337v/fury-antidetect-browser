@@ -777,6 +777,8 @@ export const ar: Record<Key, string> = {
   "px.configure": "إعداد",
   "px.newInline": "بروكسي جديد…",
   "px.saved": "تم الحفظ",
+  "px.searchSaved": "البحث في الوكلاء المحفوظين",
+  "px.noSearchResults": "لا توجد وكلاء مطابقة.",
   "px.none": "لا توجد بروكسيات بعد. لا يمكن فتح ملف شخصي بدون واحد.",
   "partner.intro": "خدمات تناسب Fury، بخصم لمستخدميه.",
   "partner.badge": "شريك",

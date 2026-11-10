@@ -777,6 +777,8 @@ export const tr: Record<Key, string> = {
   "px.configure": "Yapılandır",
   "px.newInline": "Yeni proxy…",
   "px.saved": "Kaydedildi",
+  "px.searchSaved": "Kayıtlı proxy'lerde ara",
+  "px.noSearchResults": "Eşleşen proxy yok.",
   "px.none": "Henüz proxy yok. Proxy'siz bir profil açılamaz.",
   "partner.intro": "Fury ile iyi giden, kullanıcıları için indirimli hizmetler.",
   "partner.badge": "ortak",
