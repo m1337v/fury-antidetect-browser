@@ -776,6 +776,8 @@ export const hi: Record<Key, string> = {
   "px.configure": "कॉन्फ़िगर करें",
   "px.newInline": "नई प्रॉक्सी…",
   "px.saved": "सेव हुआ",
+  "px.searchSaved": "सहेजे गए प्रॉक्सी खोजें",
+  "px.noSearchResults": "कोई मेल खाता प्रॉक्सी नहीं।",
   "px.none": "अभी कोई प्रॉक्सी नहीं है। बिना प्रॉक्सी के प्रोफ़ाइल नहीं खुल सकता।",
   "partner.intro": "Fury के साथ अच्छे चलने वाली सेवाएँ, इसके यूज़र के लिए छूट के साथ।",
   "partner.badge": "पार्टनर",

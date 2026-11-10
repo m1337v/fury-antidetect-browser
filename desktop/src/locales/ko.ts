@@ -776,6 +776,8 @@ export const ko: Record<Key, string> = {
   "px.configure": "설정",
   "px.newInline": "새 프록시…",
   "px.saved": "저장됨",
+  "px.searchSaved": "저장된 프록시 검색",
+  "px.noSearchResults": "일치하는 프록시가 없습니다.",
   "px.none": "프록시가 아직 없습니다. 프록시가 없으면 프로필을 열 수 없습니다.",
   "partner.intro": "Fury와 잘 어울리는 서비스를 사용자에게 할인된 가격으로 제공합니다.",
   "partner.badge": "파트너",

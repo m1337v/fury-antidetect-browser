@@ -33,7 +33,14 @@ import { createPortal } from "react-dom";
  *  Enter or Space to choose, Escape to close, letters to jump. */
 
 /** `heading` is an `<optgroup>`'s label: shown in the list, never chosen. */
-type Opt = { value: string; label: string; disabled: boolean; heading?: boolean };
+type Opt = {
+  value: string;
+  label: string;
+  content: ReactNode;
+  search: string;
+  disabled: boolean;
+  heading?: boolean;
+};
 
 export interface SelectChange {
   target: { value: string };
@@ -52,7 +59,7 @@ function text(node: ReactNode): string {
  *  behind a `cond && (...)`. */
 function collect(children: ReactNode, out: Opt[] = []): Opt[] {
   Children.forEach(children, (child) => {
-    if (!isValidElement<{ value?: unknown; disabled?: boolean; children?: ReactNode }>(child)) return;
+    if (!isValidElement<{ value?: unknown; disabled?: boolean; children?: ReactNode; "data-search"?: unknown }>(child)) return;
     if (child.type === Fragment) {
       collect(child.props.children, out);
       return;
@@ -61,7 +68,7 @@ function collect(children: ReactNode, out: Opt[] = []): Opt[] {
     // option can have, so a heading is never the selected row.
     if (child.type === "optgroup") {
       const label = String((child.props as { label?: unknown }).label ?? "");
-      out.push({ value: `\u0000group:${label}`, label, disabled: true, heading: true });
+      out.push({ value: `\u0000group:${label}`, label, content: label, search: label, disabled: true, heading: true });
       collect(child.props.children, out);
       return;
     }
@@ -70,6 +77,10 @@ function collect(children: ReactNode, out: Opt[] = []): Opt[] {
       out.push({
         value: child.props.value === undefined ? label : String(child.props.value),
         label,
+        content: child.props.children,
+        // Search text is opt-in so a caller can expose only values that are
+        // already safe to show. Proxy credentials must never become searchable.
+        search: typeof child.props["data-search"] === "string" ? child.props["data-search"] : label,
         disabled: !!child.props.disabled,
       });
     }
@@ -87,6 +98,9 @@ export function Select({
   style,
   title,
   autoFocus,
+  searchable = false,
+  searchPlaceholder,
+  emptyLabel,
   "aria-label": ariaLabel,
 }: {
   value?: string | number;
@@ -98,6 +112,10 @@ export function Select({
   style?: CSSProperties;
   title?: string;
   autoFocus?: boolean;
+  /** Most menus stay ordinary selects; this is for longer lists such as proxies. */
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  emptyLabel?: string;
   "aria-label"?: string;
 }) {
   const options = collect(children);
@@ -105,14 +123,19 @@ export function Select({
   const selected = options.findIndex((o) => o.value === current);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
+  const [query, setQuery] = useState("");
   const [place, setPlace] = useState<{ left: number; top: number; width: number; maxHeight: number; up: boolean } | null>(null);
   const button = useRef<HTMLButtonElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const typed = useRef({ text: "", at: 0 });
   const listId = useId();
+  const shown = !searchable || !query.trim()
+    ? options
+    : options.filter((o) => o.heading || o.search.toLowerCase().includes(query.trim().toLowerCase()));
 
   const choose = (i: number) => {
-    const o = options[i];
+    const o = shown[i];
     if (!o || o.disabled) return;
     setOpen(false);
     button.current?.focus();
@@ -120,15 +143,16 @@ export function Select({
   };
 
   const step = (from: number, dir: 1 | -1) => {
-    for (let i = from + dir; i >= 0 && i < options.length; i += dir) {
-      if (!options[i].disabled) return i;
+    for (let i = from + dir; i >= 0 && i < shown.length; i += dir) {
+      if (!shown[i].disabled) return i;
     }
     return from;
   };
 
   const show = () => {
     if (disabled || options.length === 0) return;
-    setActive(selected >= 0 ? selected : step(-1, 1));
+    setQuery("");
+    setActive(selected >= 0 ? selected : options.findIndex((o) => !o.disabled));
     setOpen(true);
   };
 
@@ -138,7 +162,7 @@ export function Select({
     const r = button.current.getBoundingClientRect();
     const below = window.innerHeight - r.bottom - 8;
     const above = r.top - 8;
-    const want = Math.min(320, options.length * 30 + 10);
+    const want = Math.min(320, shown.length * 30 + (searchable ? 48 : 10));
     const up = below < want && above > below;
     setPlace({
       left: r.left,
@@ -147,7 +171,11 @@ export function Select({
       maxHeight: Math.max(120, Math.min(320, up ? above : below)),
       up,
     });
-  }, [open, options.length]);
+  }, [open, shown.length, searchable]);
+
+  useEffect(() => {
+    if (open && searchable) searchInput.current?.focus();
+  }, [open, searchable, place]);
 
   // Closed by anything that would leave it floating over the wrong place.
   useEffect(() => {
@@ -180,7 +208,7 @@ export function Select({
     list.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)?.scrollIntoView({ block: "nearest" });
   }, [open, active, place]);
 
-  const onKey = (e: React.KeyboardEvent) => {
+  const onKey = (e: React.KeyboardEvent, fromSearch = false) => {
     if (disabled) return;
     if (!open) {
       if (["ArrowDown", "ArrowUp", "Enter", " "].includes(e.key)) {
@@ -189,6 +217,9 @@ export function Select({
       }
       return;
     }
+    // The search box is still a text box: Home, End and Space edit its query
+    // rather than moving or selecting rows in a portalled menu.
+    if (fromSearch && !["ArrowDown", "ArrowUp", "Enter", "Escape", "Tab"].includes(e.key)) return;
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
@@ -204,7 +235,7 @@ export function Select({
         return;
       case "End":
         e.preventDefault();
-        setActive(step(options.length, -1));
+        setActive(step(shown.length, -1));
         return;
       case "Enter":
       case " ":
@@ -215,18 +246,26 @@ export function Select({
         e.preventDefault();
         e.stopPropagation();
         setOpen(false);
+        button.current?.focus();
         return;
       case "Tab":
+        // A portalled input has no useful DOM neighbour in the dialog. Return
+        // focus to its trigger rather than letting Tab disappear into the page.
+        if (fromSearch) {
+          e.preventDefault();
+          button.current?.focus();
+        }
         setOpen(false);
         return;
     }
+    if (fromSearch) return;
     // Type to jump, as a native menu does.
     if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const now = Date.now();
       const t = typed.current;
       t.text = (now - t.at < 700 ? t.text : "") + e.key.toLowerCase();
       t.at = now;
-      const i = options.findIndex((o) => !o.disabled && o.label.toLowerCase().startsWith(t.text));
+      const i = shown.findIndex((o) => !o.disabled && o.label.toLowerCase().startsWith(t.text));
       if (i >= 0) setActive(i);
     }
   };
@@ -278,8 +317,6 @@ export function Select({
         createPortal(
           <div
             ref={list}
-            id={listId}
-            role="listbox"
             className="selectList"
             style={{
               left: place.left,
@@ -288,7 +325,28 @@ export function Select({
               ...(place.up ? { bottom: window.innerHeight - place.top } : { top: place.top }),
             }}
           >
-            {options.map((o, i) =>
+            {searchable && (
+              <div className="selectSearch">
+                <input
+                  ref={searchInput}
+                  value={query}
+                  type="search"
+                  spellCheck={false}
+                  autoComplete="off"
+                  placeholder={searchPlaceholder}
+                  aria-label={searchPlaceholder ?? ariaLabel}
+                  aria-controls={listId}
+                  aria-activedescendant={active >= 0 ? `${listId}-${active}` : undefined}
+                  onChange={(e) => {
+                    setQuery(e.target.value);
+                    setActive(-1);
+                  }}
+                  onKeyDown={(e) => onKey(e, true)}
+                />
+              </div>
+            )}
+            <div id={listId} role="listbox">
+            {shown.map((o, i) =>
               o.heading ? (
                 <div key={i} role="presentation" className="selectHeading">
                   {o.label}
@@ -299,18 +357,20 @@ export function Select({
                 id={`${listId}-${i}`}
                 data-index={i}
                 role="option"
-                aria-selected={i === selected}
+                aria-selected={o.value === current}
                 aria-disabled={o.disabled || undefined}
                 className={"selectOption" + (i === active ? " active" : "") + (o.disabled ? " disabled" : "")}
                 onMouseMove={() => !o.disabled && active !== i && setActive(i)}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => choose(i)}
               >
-                <span className="selectCheck">{i === selected ? "✓" : ""}</span>
-                <span className="selectLabel">{o.label || " "}</span>
+                <span className="selectCheck">{o.value === current ? "✓" : ""}</span>
+                <span className="selectLabel">{searchable ? (o.content || o.label) : o.label || " "}</span>
               </div>
             ),
             )}
+            {shown.length === 0 && <div className="selectEmpty" role="status">{emptyLabel}</div>}
+            </div>
           </div>,
           document.body,
         )}

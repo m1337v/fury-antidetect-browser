@@ -776,6 +776,8 @@ export const pt: Record<Key, string> = {
   "px.configure": "Configurar",
   "px.newInline": "Novo proxy…",
   "px.saved": "Salvo",
+  "px.searchSaved": "Pesquisar proxies salvos",
+  "px.noSearchResults": "Nenhum proxy correspondente.",
   "px.none": "Ainda não há proxies. Um perfil não pode ser aberto sem um.",
   "partner.intro": "Serviços que combinam com o Fury, com desconto para quem o usa.",
   "partner.badge": "parceiro",

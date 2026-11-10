@@ -776,6 +776,8 @@ export const uk: Record<Key, string> = {
   "px.configure": "Налаштувати",
   "px.newInline": "Нове проксі…",
   "px.saved": "Збережено",
+  "px.searchSaved": "Шукати збережені проксі",
+  "px.noSearchResults": "Немає відповідних проксі.",
   "px.none": "Проксі ще немає. Профіль не можна відкрити без нього.",
   "partner.intro": "Сервіси, які добре поєднуються з Fury, зі знижкою для її користувачів.",
   "partner.badge": "партнер",

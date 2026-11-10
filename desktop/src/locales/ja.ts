@@ -776,6 +776,8 @@ export const ja: Record<Key, string> = {
   "px.configure": "設定",
   "px.newInline": "新規プロキシ…",
   "px.saved": "保存しました",
+  "px.searchSaved": "保存済みプロキシを検索",
+  "px.noSearchResults": "一致するプロキシはありません。",
   "px.none": "プロキシがまだありません。プロキシがないと、プロファイルは開けません。",
   "partner.intro": "Fury と相性のよいサービスを、ユーザー向けの割引価格で提供しています。",
   "partner.badge": "パートナー",
